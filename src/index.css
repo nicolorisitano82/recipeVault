@@ -1,0 +1,41 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Outfit:wght@300;400;500;600&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  min-height: 100dvh;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Outfit', sans-serif;
+  background: #F5F0E8;
+  color: #1C1A14;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overscroll-behavior-y: contain;
+}
+
+/* Allow text selection inside recipe content */
+.selectable { user-select: text; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: #D0C8B8; border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+input, select, textarea, button { font-family: 'Outfit', sans-serif; }
+
+textarea { user-select: text; }
+
+@media (max-width: 920px) {
+  html, body, #root {
+    overflow: auto;
+  }
+
+  body {
+    min-height: 100dvh;
+    padding-top: env(safe-area-inset-top);
+    background: linear-gradient(180deg, #F5F0E8 0%, #EFE6DA 100%);
+  }
+}

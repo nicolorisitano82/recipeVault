@@ -1,0 +1,33 @@
+{
+  "bundle": {
+    "macOS": {
+      "files": {
+        "MacOS/libggml-base.0.dylib": "./binaries/libggml-base.0.dylib",
+        "MacOS/libggml-base.0.12.0.dylib": "./binaries/libggml-base.0.12.0.dylib",
+        "MacOS/libggml-blas.0.dylib": "./binaries/libggml-blas.0.dylib",
+        "MacOS/libggml-blas.0.12.0.dylib": "./binaries/libggml-blas.0.12.0.dylib",
+        "MacOS/libggml-cpu.0.dylib": "./binaries/libggml-cpu.0.dylib",
+        "MacOS/libggml-cpu.0.12.0.dylib": "./binaries/libggml-cpu.0.12.0.dylib",
+        "MacOS/libggml-metal.0.dylib": "./binaries/libggml-metal.0.dylib",
+        "MacOS/libggml-metal.0.12.0.dylib": "./binaries/libggml-metal.0.12.0.dylib",
+        "MacOS/libggml-rpc.0.dylib": "./binaries/libggml-rpc.0.dylib",
+        "MacOS/libggml-rpc.0.12.0.dylib": "./binaries/libggml-rpc.0.12.0.dylib",
+        "MacOS/libggml.0.dylib": "./binaries/libggml.0.dylib",
+        "MacOS/libggml.0.12.0.dylib": "./binaries/libggml.0.12.0.dylib",
+        "MacOS/libllama-common.0.dylib": "./binaries/libllama-common.0.dylib",
+        "MacOS/libllama-common.0.0.9251.dylib": "./binaries/libllama-common.0.0.9251.dylib",
+        "MacOS/libllama.0.dylib": "./binaries/libllama.0.dylib",
+        "MacOS/libllama.0.0.9251.dylib": "./binaries/libllama.0.0.9251.dylib",
+        "MacOS/libmtmd.0.dylib": "./binaries/libmtmd.0.dylib",
+        "MacOS/libmtmd.0.0.9251.dylib": "./binaries/libmtmd.0.0.9251.dylib"
+      }
+    },
+    "externalBin": [
+      "binaries/llama-cli",
+      "binaries/llama-mtmd-cli",
+      "binaries/whisper-cli",
+      "binaries/yt-dlp",
+      "binaries/ffmpeg"
+    ]
+  }
+}

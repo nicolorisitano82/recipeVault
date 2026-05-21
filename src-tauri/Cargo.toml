@@ -1,0 +1,20 @@
+[package]
+name = "recipevault"
+version = "0.1.0"
+description = "RecipeVault - Gestione Ricette con AI"
+authors = []
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+regex = "1"
+base64 = "0.22"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

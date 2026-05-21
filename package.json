@@ -1,0 +1,27 @@
+{
+  "name": "recipevault",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "android:web": "vite build --config vite.android.config.js",
+    "android:prepare": "npm run android:web",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev -c src-tauri/tauri.sidecar.conf.json",
+    "tauri:build": "tauri build -c src-tauri/tauri.sidecar.conf.json",
+    "tauri:build:x64": "tauri build --target x86_64-apple-darwin",
+    "tauri:build:universal": "tauri build --target universal-apple-darwin"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@vitejs/plugin-react": "^4.2.0",
+    "vite": "^5.0.0"
+  }
+}
