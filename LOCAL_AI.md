@@ -2,17 +2,19 @@
 
 RecipeVault ora supporta un provider `Locale (on-device)` sia nella versione Tauri desktop sia nella shell Android.
 
-## Modello consigliato
+## Preset consigliati
 
-- Desktop Tauri: `Gemma 3n E2B Instruct` in formato `GGUF` quantizzato 4-bit
-- Android: `Gemma 3n E2B` in formato `.task` compatibile MediaPipe / LiteRT
+- Desktop Tauri: `Gemma 3n E4B Instruct` in formato `GGUF` quantizzato 4-bit come preset `Alta qualità`
+- Desktop fallback: `Gemma 3n E2B Instruct` come preset `Bilanciato`
+- Android default: `Gemma 3n E2B` in formato `.task` compatibile MediaPipe / LiteRT
+- Android opzionale: `Gemma 3n E4B` come preset `Alta qualità`, consigliato solo su device recenti
 
 ## Desktop Tauri
 
 1. Sulle build macOS Apple Silicon di RecipeVault (`npm run tauri:dev` e `npm run tauri:build`) il runtime `llama.cpp` è già incluso nell'app.
 2. In RecipeVault apri `Importa da URL`.
 3. Scegli `Locale (on-device)`.
-4. Puoi usare `Scarica Gemma 3n E2B` per scaricare automaticamente il file GGUF dentro i dati dell'app.
+4. Puoi usare `Scarica Gemma 3n E4B` per il preset desktop consigliato, oppure `Scarica Gemma 3n E2B` se preferisci il profilo bilanciato.
 5. In alternativa puoi inserire manualmente:
    - `Percorso modello locale`: ad esempio `/Users/<utente>/Models/gemma-3n-e2b-it-Q4_K_M.gguf`
    - `Runtime desktop`: lascia `@auto` per usare il runtime incorporato, oppure indica `llama-cli` / un percorso assoluto solo se vuoi forzare un runtime esterno
@@ -26,6 +28,29 @@ RecipeVault include anche un piccolo wizard per `llama.cpp`:
 - sulle build desktop native del Mac (`npm run tauri:dev` e `npm run tauri:build`) RecipeVault usa automaticamente il sidecar incorporato `@bundled`
 - le build `x86_64` e `universal` restano al momento su runtime manuale finché non viene aggiunto un binario Intel reale
 
+### Generazione immagine locale del piatto
+
+Per le ricette importate da libro puoi generare una foto realistica del piatto finale anche senza OpenAI, usando un runtime locale separato:
+
+1. Apri `⚙️ Configurazione AI`.
+2. Nel blocco `Componenti comuni`, compila:
+   - `Generazione immagini locale (desktop)` → percorso del modello immagine locale
+   - `@auto oppure /percorso/sd-cli` → runtime compatibile con `stable-diffusion.cpp`
+3. Puoi usare `⬇️ Scarica SDXL Turbo` per scaricare automaticamente il checkpoint ufficiale nel data directory dell'app.
+4. Dopo il download, il percorso del modello viene compilato automaticamente.
+5. Torna su una ricetta importata da libro e usa `🖼️ Genera foto piatto`.
+
+RecipeVault in questa fase si aspetta un runtime `sd-cli` compatibile con `stable-diffusion.cpp`, che secondo la documentazione ufficiale espone `--model`, `--prompt` e `--output` per la generazione `img_gen`.
+
+Il preset scaricato di default è `SDXL Turbo`, che secondo la documentazione ufficiale è pensato per generare immagini in 1-4 step.
+
+Riferimenti ufficiali:
+
+- `stable-diffusion.cpp` supporta modelli `GGUF`, `safetensors` e `ckpt/pth/pt`
+- quick start ufficiale: `./bin/sd-cli -m ../models/v1-5-pruned-emaonly.safetensors -p "a lovely cat"`
+
+Nota: il runtime immagine non è ancora bundlettato dentro RecipeVault come `llama.cpp`, quindi al momento va installato o copiato separatamente sul desktop.
+
 ## Android
 
 L'inferenza locale Android usa `MediaPipe LLM Inference` e funziona meglio su device reali recenti. Gli emulatori spesso non sono supportati.
@@ -38,13 +63,15 @@ La soluzione tecnica consigliata su Android è:
 
 ### Opzione A: modello su filesystem del device
 
-1. Puoi usare `Scarica Gemma 3n E2B` direttamente dall'app: il file `.task` viene salvato nello storage interno di RecipeVault.
-2. In alternativa copia il file `.task` sul device, ad esempio:
+1. Puoi usare `Scarica Gemma 3n E2B` direttamente dall'app: è il preset Android consigliato e il file `.task` viene salvato nello storage interno di RecipeVault.
+2. Se hai un device potente puoi selezionare `Gemma 3n E4B — Alta qualità` e scaricare anche quel `.task`, ma è più pesante in RAM, storage e tempi di risposta.
+3. In alternativa copia il file `.task` sul device, ad esempio:
    - `/data/local/tmp/llm/gemma-3n-e2b.task`
-3. In RecipeVault apri `Importa da URL`.
-4. Scegli `Locale (on-device)`.
-5. Inserisci il percorso del file `.task`.
-6. Premi `Verifica modello`.
+4. In RecipeVault apri `Importa da URL`.
+5. Scegli `Locale (on-device)`.
+6. Seleziona il preset locale desiderato (`Bilanciato` o `Alta qualità`).
+7. Inserisci il percorso del file `.task`.
+8. Premi `Verifica modello`.
 
 ### Opzione B: modello incluso nel progetto Android
 
@@ -52,11 +79,12 @@ Il bridge supporta anche asset interni tramite schema `asset://`.
 
 1. Copia il file `.task` in:
    - `android-studio/app/src/main/assets/models/`
-2. Ricompila l'app Android.
-3. In RecipeVault puoi:
+2. Se vuoi supportare sia E2B sia E4B, puoi inserire entrambi i file: RecipeVault proverà a scegliere quello coerente con il preset selezionato.
+3. Ricompila l'app Android.
+4. In RecipeVault puoi:
    - usare direttamente `@bundled`
    - oppure premere `Usa modello incluso` nel modal locale
-4. Premi `Verifica modello`.
+5. Premi `Verifica modello`.
 
 Alla prima esecuzione l'asset viene copiato nello storage interno dell'app.
 
@@ -101,3 +129,4 @@ RecipeVault include `whisper-cli` come sidecar (compilato staticamente, 3.1 MB, 
 - I modelli non sono versionati nel repository: sono troppo grandi per essere committati qui.
 - In locale l'import da URL non usa web search esterna: RecipeVault estrae il testo della pagina e lo passa al modello.
 - Per social chiusi come TikTok o Instagram senza modello vision, è consigliato incollare la didascalia per migliorare il risultato.
+- La generazione immagine locale del piatto è supportata solo su desktop Tauri. Su Android non è ancora disponibile.

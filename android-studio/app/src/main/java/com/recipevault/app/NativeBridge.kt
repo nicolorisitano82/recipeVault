@@ -2,6 +2,8 @@ package com.recipevault.app
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -52,6 +54,51 @@ class NativeBridge(private val context: Context) {
     }
   }
 
+  private data class StoredModelFile(
+    val path: String,
+    val name: String,
+    val sizeBytes: Long,
+    val isActive: Boolean
+  ) {
+    fun toJson(): JSONObject {
+      return JSONObject()
+        .put("path", path)
+        .put("name", name)
+        .put("sizeBytes", sizeBytes)
+        .put("isActive", isActive)
+    }
+  }
+
+  private data class ModelStorageStatus(
+    val rootPath: String,
+    val totalBytes: Long,
+    val activeBytes: Long,
+    val inactiveBytes: Long,
+    val files: List<StoredModelFile>
+  ) {
+    fun toJson(): JSONObject {
+      return JSONObject()
+        .put("rootPath", rootPath)
+        .put("totalBytes", totalBytes)
+        .put("activeBytes", activeBytes)
+        .put("inactiveBytes", inactiveBytes)
+        .put("files", JSONArray().apply { files.forEach { put(it.toJson()) } })
+    }
+  }
+
+  private data class CleanModelsResult(
+    val deletedCount: Int,
+    val freedBytes: Long,
+    val deletedPaths: List<String>
+  ) {
+    fun toJson(): JSONObject {
+      return JSONObject()
+        .put("deletedCount", deletedCount)
+        .put("freedBytes", freedBytes)
+        .put("deletedPaths", JSONArray().apply { deletedPaths.forEach { put(it) } })
+    }
+  }
+
   @JavascriptInterface
   fun invoke(command: String, argsJson: String?): String {
     return try {
@@ -60,11 +107,15 @@ class NativeBridge(private val context: Context) {
 
       val data: Any = when (command) {
         "call_ai" -> callAi(payload)
+        "generate_recipe_image" -> generateRecipeImage(payload)
+        "open_external_url" -> openExternalUrl(payload)
         "test_api_key" -> testApiKey(payload)
         "extract_url_content" -> extractUrlContent(payload)
+        "get_model_storage_status" -> getModelStorageStatus(payload)
+        "clean_unused_models" -> cleanUnusedModels(payload)
         "start_local_model_download" -> startLocalModelDownload(payload)
         "get_local_model_download_status" -> getLocalModelDownloadStatus(payload)
-        "get_local_android_model_status" -> getLocalAndroidModelStatus()
+        "get_local_android_model_status" -> getLocalAndroidModelStatus(payload)
         "export_backup" -> exportBackup(payload)
         else -> throw IllegalArgumentException("Comando non supportato: $command")
       }
@@ -302,6 +353,76 @@ class NativeBridge(private val context: Context) {
     return status.toJson()
   }
 
+  private fun getModelStorageStatus(payload: JSONObject): JSONObject {
+    val rootDir = File(context.filesDir, "local-models").apply { mkdirs() }
+    val activePaths = payload.optJSONArray("activePaths")
+      ?.let { array -> (0 until array.length()).mapNotNull { index -> array.optString(index).takeIf { it.isNotBlank() } } }
+      ?.map { File(it).canonicalPath }
+      ?.toSet()
+      ?: emptySet()
+    val activeVisionDirs = payload.optJSONArray("activeVisionModelPaths")
+      ?.let { array -> (0 until array.length()).mapNotNull { index -> array.optString(index).takeIf { it.isNotBlank() } } }
+      ?.map { File(it).canonicalFile.parentFile?.canonicalPath }
+      ?.filterNotNull()
+      ?.toSet()
+      ?: emptySet()
+
+    val files = rootDir.walkTopDown()
+      .filter { it.isFile }
+      .map { file ->
+        val canonicalPath = file.canonicalPath
+        val isMmproj = file.name.startsWith("mmproj-") && file.name.endsWith(".gguf", ignoreCase = true)
+        val isActive = canonicalPath in activePaths || (isMmproj && file.parentFile?.canonicalPath in activeVisionDirs)
+        StoredModelFile(
+          path = canonicalPath,
+          name = file.name,
+          sizeBytes = file.length(),
+          isActive = isActive
+        )
+      }
+      .sortedWith(compareByDescending<StoredModelFile> { it.sizeBytes }.thenBy { it.name })
+      .toList()
+
+    val totalBytes = files.sumOf { it.sizeBytes }
+    val activeBytes = files.filter { it.isActive }.sumOf { it.sizeBytes }
+    return ModelStorageStatus(
+      rootPath = rootDir.absolutePath,
+      totalBytes = totalBytes,
+      activeBytes = activeBytes,
+      inactiveBytes = totalBytes - activeBytes,
+      files = files
+    ).toJson()
+  }
+
+  private fun cleanUnusedModels(payload: JSONObject): JSONObject {
+    val status = getModelStorageStatus(payload)
+    val files = status.optJSONArray("files") ?: JSONArray()
+    val deletedPaths = mutableListOf<String>()
+    var freedBytes = 0L
+
+    for (index in 0 until files.length()) {
+      val file = files.optJSONObject(index) ?: continue
+      if (file.optBoolean("isActive")) continue
+      val path = file.optString("path").trim()
+      if (path.isEmpty()) continue
+      val target = File(path)
+      val fileSize = file.optLong("sizeBytes")
+      if (target.exists() && target.isFile) {
+        if (!target.delete()) {
+          throw IllegalStateException("Impossibile eliminare ${target.absolutePath}")
+        }
+        deletedPaths += target.absolutePath
+        freedBytes += fileSize
+      }
+    }
+
+    return CleanModelsResult(
+      deletedCount = deletedPaths.size,
+      freedBytes = freedBytes,
+      deletedPaths = deletedPaths
+    ).toJson()
+  }
+
   private fun callClaude(payload: JSONObject): String {
     val imageDataUrl = payload.optString("imageDataUrl").trim()
     val requestContent = JSONArray()
@@ -433,6 +554,69 @@ class NativeBridge(private val context: Context) {
     return collectTextContent(message?.opt("content"))
   }
 
+  private fun generateRecipeImage(payload: JSONObject): String {
+    val provider = payload.optString("provider").trim().ifEmpty {
+      if (payload.optString("apiKey").isNotBlank()) "openai" else "local"
+    }
+
+    if (provider == "local") {
+      throw IllegalArgumentException("La generazione immagine locale non è ancora supportata su Android. Per ora usa la versione desktop.")
+    }
+
+    val body = JSONObject()
+      .put("model", "gpt-image-1.5")
+      .put("prompt", payload.getString("prompt"))
+      .put("size", "1024x1024")
+      .put("quality", "medium")
+      .put("background", "opaque")
+      .put("output_format", "webp")
+      .put("output_compression", 80)
+
+    val (status, responseBody) = requestJson(
+      endpoint = "https://api.openai.com/v1/images/generations",
+      method = "POST",
+      headers = mapOf(
+        "Content-Type" to "application/json",
+        "Authorization" to "Bearer ${payload.getString("apiKey")}"
+      ),
+      body = body
+    )
+
+    if (status !in 200..299) {
+      throw IllegalStateException(extractErrorMessage(responseBody, "OpenAI Images HTTP $status"))
+    }
+
+    val json = JSONObject(responseBody)
+    val data = json.optJSONArray("data") ?: JSONArray()
+    val first = data.optJSONObject(0)
+      ?: throw IllegalStateException("OpenAI non ha restituito nessuna immagine")
+    val base64Image = first.optString("b64_json").trim()
+    if (base64Image.isEmpty()) {
+      throw IllegalStateException("OpenAI non ha restituito nessuna immagine")
+    }
+
+    return "data:image/webp;base64,$base64Image"
+  }
+
+  private fun openExternalUrl(payload: JSONObject): Boolean {
+    val rawUrl = payload.optString("url").trim()
+    if (rawUrl.isEmpty()) {
+      throw IllegalArgumentException("URL sorgente mancante")
+    }
+
+    val uri = Uri.parse(rawUrl)
+    val scheme = uri.scheme?.lowercase()
+    if (scheme != "http" && scheme != "https") {
+      throw IllegalArgumentException("Sono supportati solo link http/https")
+    }
+
+    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(intent)
+    return true
+  }
+
   private fun callLocal(payload: JSONObject): String {
     if (payload.optString("imageDataUrl").trim().isNotEmpty()) {
       throw IllegalArgumentException("Su Android il modello locale non supporta ancora l'analisi foto. Usa Claude o OpenAI per questa modalità.")
@@ -455,7 +639,8 @@ class NativeBridge(private val context: Context) {
   private fun validateLocalModelPath(payload: JSONObject): String {
     val localOptions = payload.optJSONObject("localOptions")
       ?: throw IllegalArgumentException("Configurazione del modello locale mancante")
-    val modelPath = resolveLocalModelPath(localOptions).trim()
+    val preferredModel = payload.optString("model").trim()
+    val modelPath = resolveLocalModelPath(localOptions, preferredModel).trim()
 
     if (modelPath.isEmpty()) {
       throw IllegalArgumentException("Percorso del modello locale mancante")
@@ -469,16 +654,18 @@ class NativeBridge(private val context: Context) {
     return file.absolutePath
   }
 
-  private fun resolveLocalModelPath(localOptions: JSONObject): String {
+  private fun resolveLocalModelPath(localOptions: JSONObject, payloadModel: String = ""): String {
     val configuredPath = localOptions.optString("modelPath").trim()
+    val preferredModel = payloadModel.ifBlank { localOptions.optString("preferredModel").trim() }
     if (configuredPath == "@bundled" || configuredPath == "@auto") {
-      val bundledModel = resolveBundledModel()
+      val bundledModel = resolveBundledModel(preferredModel, strict = configuredPath == "@bundled")
       if (bundledModel != null) {
         return bundledModel
       }
 
       if (configuredPath == "@bundled") {
-        throw IllegalArgumentException("Nessun modello incluso trovato in assets/models")
+        val suffix = preferredModel.takeIf { it.isNotBlank() }?.let { " compatibile con $it" } ?: ""
+        throw IllegalArgumentException("Nessun modello incluso$suffix trovato in assets/models")
       }
     }
     if (configuredPath.startsWith("asset://")) {
@@ -487,24 +674,47 @@ class NativeBridge(private val context: Context) {
     return configuredPath
   }
 
-  private fun resolveBundledModel(): String? {
-    val assetPath = findBundledModelAssetPath() ?: return null
+  private fun resolveBundledModel(preferredModel: String = "", strict: Boolean = false): String? {
+    val assetPath = findBundledModelAssetPath(preferredModel, strict) ?: return null
     return copyAssetToInternalStorage(assetPath)
   }
 
-  private fun findBundledModelAssetPath(): String? {
-    val entries = context.assets.list("models") ?: return null
-    return entries
+  private fun findBundledModelAssetPath(preferredModel: String = "", strict: Boolean = false): String? {
+    val taskEntries = (context.assets.list("models") ?: emptyArray())
+      .filter { it.endsWith(".task", ignoreCase = true) }
       .sorted()
-      .firstOrNull { it.endsWith(".task", ignoreCase = true) }
-      ?.let { "models/$it" }
+
+    if (taskEntries.isEmpty()) return null
+
+    val normalized = preferredModel.lowercase()
+    val token = when {
+      normalized.contains("e4b") -> "e4b"
+      normalized.contains("e2b") -> "e2b"
+      normalized.contains("qwen") -> "qwen"
+      else -> null
+    }
+
+    if (token != null) {
+      val match = taskEntries.firstOrNull { it.lowercase().contains(token) }
+      if (match != null) {
+        return "models/$match"
+      }
+      if (strict) return null
+    }
+
+    return taskEntries.firstOrNull()?.let { "models/$it" }
   }
 
-  private fun getLocalAndroidModelStatus(): JSONObject {
-    val assetPath = findBundledModelAssetPath()
+  private fun getLocalAndroidModelStatus(payload: JSONObject): JSONObject {
+    val preferredModel = payload.optString("model").trim()
+    val assetPath = findBundledModelAssetPath(preferredModel, strict = preferredModel.isNotBlank())
       ?: return BundledModelStatus(
         found = false,
-        error = "Nessun modello `.task` trovato in assets/models"
+        error = if (preferredModel.isNotBlank()) {
+          "Nessun modello `.task` compatibile con $preferredModel trovato in assets/models"
+        } else {
+          "Nessun modello `.task` trovato in assets/models"
+        }
       ).toJson()
 
     val resolvedPath = try {

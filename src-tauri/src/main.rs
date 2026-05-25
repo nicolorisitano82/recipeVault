@@ -6,7 +6,7 @@ use std::{
     io::Read,
     io::Write,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -48,12 +48,31 @@ struct ApiKeyPayload {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecipeImagePayload {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    api_key: String,
+    prompt: String,
+    #[serde(default)]
+    local_model_path: String,
+    #[serde(default)]
+    local_runtime_path: String,
+}
+
+#[derive(Deserialize)]
 struct ExportBackupPayload {
     json: String,
 }
 
 #[derive(Deserialize)]
 struct UrlExtractPayload {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct ExternalUrlPayload {
     url: String,
 }
 
@@ -74,6 +93,15 @@ struct DownloadStatusPayload {
 #[serde(rename_all = "camelCase")]
 struct LocalRuntimeStatusPayload {
     runtime_path: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ModelStoragePayload {
+    #[serde(default)]
+    active_paths: Vec<String>,
+    #[serde(default)]
+    active_vision_model_paths: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +137,33 @@ struct LocalModelDownloadStatus {
     total_bytes: Option<u64>,
     path: String,
     error: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredModelFile {
+    path: String,
+    name: String,
+    size_bytes: u64,
+    is_active: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStorageStatus {
+    root_path: String,
+    total_bytes: u64,
+    active_bytes: u64,
+    inactive_bytes: u64,
+    files: Vec<StoredModelFile>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanModelsResult {
+    deleted_count: usize,
+    freed_bytes: u64,
+    deleted_paths: Vec<String>,
 }
 
 fn extract_error_message(body: &str, fallback: impl Into<String>) -> String {
@@ -178,6 +233,44 @@ fn local_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("Impossibile creare la cartella modelli: {error}"))?;
 
     Ok(dir)
+}
+
+fn normalized_existing_path(raw_path: &str) -> Option<PathBuf> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() || trimmed.starts_with('@') || trimmed.starts_with("asset://") {
+        return None;
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return None;
+    }
+
+    Some(fs::canonicalize(&path).unwrap_or(path))
+}
+
+fn collect_model_files(root: &PathBuf) -> Result<Vec<PathBuf>, String> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    let mut stack = vec![root.clone()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|error| format!("Impossibile leggere la cartella modelli: {error}"))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
+    Ok(files)
 }
 
 fn bundled_sidecar_name() -> &'static str {
@@ -264,6 +357,10 @@ fn resolve_llama_mtmd_cli(app: &tauri::AppHandle) -> Option<String> {
 
 fn resolve_whisper_cli(app: &tauri::AppHandle) -> Option<String> {
     resolve_sidecar_or_system(app, "whisper-cli")
+}
+
+fn resolve_sd_cli(app: &tauri::AppHandle) -> Option<String> {
+    resolve_sidecar_or_system(app, "sd-cli")
 }
 
 fn find_whisper_model(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -691,9 +788,25 @@ fn local_runtime_path(options: &LocalAiOptions) -> String {
         .to_owned()
 }
 
+fn image_gen_runtime_path(payload: &RecipeImagePayload) -> String {
+    payload
+        .local_runtime_path
+        .trim()
+        .to_owned()
+}
+
 fn normalize_runtime_hint(runtime_hint: Option<&str>) -> String {
     let hint = runtime_hint.map(str::trim).unwrap_or_default();
     if hint.is_empty() || hint == "llama-cli" {
+        "@auto".to_owned()
+    } else {
+        hint.to_owned()
+    }
+}
+
+fn normalize_image_gen_runtime_hint(runtime_hint: Option<&str>) -> String {
+    let hint = runtime_hint.map(str::trim).unwrap_or_default();
+    if hint.is_empty() || hint == "sd-cli" {
         "@auto".to_owned()
     } else {
         hint.to_owned()
@@ -720,6 +833,26 @@ fn check_local_runtime(runtime_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn check_image_gen_runtime(runtime_path: &str) -> Result<(), String> {
+    let output = Command::new(runtime_path)
+        .arg("--help")
+        .output()
+        .map_err(|error| format!("Runtime immagini locale non disponibile ({runtime_path}): {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(if detail.is_empty() {
+            format!("Runtime immagini locale non disponibile ({runtime_path})")
+        } else {
+            format!("Runtime immagini locale non disponibile ({runtime_path}): {detail}")
+        });
+    }
+
+    Ok(())
+}
+
 fn read_child_stream<R>(mut stream: R) -> thread::JoinHandle<Vec<u8>>
 where
     R: Read + Send + 'static,
@@ -728,6 +861,85 @@ where
         let mut buffer = Vec::new();
         let _ = stream.read_to_end(&mut buffer);
         buffer
+    })
+}
+
+fn sanitize_llama_output(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .trim()
+        .replace("<|im_end|>", "")
+        .replace("<|endoftext|>", "")
+        .replace("<end_of_turn>", "")
+        .trim()
+        .to_owned()
+}
+
+fn join_process_detail(stdout: &str, stderr: &str) -> String {
+    [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_vision_backend_init_error(detail: &str) -> bool {
+    let normalized = detail.to_lowercase();
+    normalized.contains("ggml_metal_init")
+        || normalized.contains("failed to create command queue")
+        || normalized.contains("failed to allocate context")
+        || normalized.contains("failed to initialize backend")
+        || normalized.contains("failed to initialize  backend")
+        || normalized.contains("failed to create context")
+}
+
+struct VisionProcessResult {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_vision_process(mtmd_cli_path: &str, args: &[String]) -> Result<VisionProcessResult, String> {
+    let started_at = Instant::now();
+    let mut child = Command::new(mtmd_cli_path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Errore avviando il modello vision: {e}"))?;
+
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(read_child_stream)
+        .ok_or_else(|| "Impossibile leggere output modello vision".to_owned())?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(read_child_stream)
+        .ok_or_else(|| "Impossibile leggere gli errori del modello vision".to_owned())?;
+
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("Errore monitorando modello vision: {e}"))?
+        {
+            Some(status) => break status,
+            None => {
+                if Instant::now().duration_since(started_at) > Duration::from_secs(300) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Il modello vision non ha risposto entro 5 minuti".to_owned());
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    Ok(VisionProcessResult {
+        status,
+        stdout: sanitize_llama_output(&stdout_reader.join().unwrap_or_default()),
+        stderr: sanitize_llama_output(&stderr_reader.join().unwrap_or_default()),
     })
 }
 
@@ -789,6 +1001,17 @@ fn resolve_bundled_runtime(app: &tauri::AppHandle) -> Option<PathBuf> {
         })
 }
 
+fn resolve_bundled_image_gen_runtime(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let bin_name = if cfg!(target_os = "windows") { "sd-cli.exe" } else { "sd-cli" };
+    sidecar_candidates(app, bin_name)
+        .into_iter()
+        .find(|candidate| {
+            candidate.exists()
+                && candidate.is_file()
+                && check_image_gen_runtime(&candidate.display().to_string()).is_ok()
+        })
+}
+
 fn resolve_runtime_command(app: &tauri::AppHandle, runtime_hint: Option<&str>) -> Result<(String, String), String> {
     let hint = normalize_runtime_hint(runtime_hint);
 
@@ -816,6 +1039,56 @@ fn resolve_runtime_command(app: &tauri::AppHandle, runtime_hint: Option<&str>) -
 
     let command = hint;
     Ok((command.to_owned(), "manual".to_owned()))
+}
+
+fn image_gen_runtime_candidates(runtime_hint: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(hint) = runtime_hint.map(str::trim).filter(|value| !value.is_empty()) {
+        candidates.push(hint.to_owned());
+    }
+    for candidate in ["sd-cli", "/opt/homebrew/bin/sd-cli", "/usr/local/bin/sd-cli"] {
+        if !candidates.iter().any(|existing| existing == candidate) {
+            candidates.push(candidate.to_owned());
+        }
+    }
+    candidates
+}
+
+fn resolve_image_gen_runtime_command(
+    app: &tauri::AppHandle,
+    runtime_hint: Option<&str>,
+) -> Result<(String, String), String> {
+    let hint = normalize_image_gen_runtime_hint(runtime_hint);
+
+    if hint == "@bundled" {
+        if let Some(path) = resolve_bundled_image_gen_runtime(app) {
+            return Ok((path.display().to_string(), "bundled".to_owned()));
+        }
+
+        return Err("Runtime immagini incorporato non trovato in questa build desktop".to_owned());
+    }
+
+    if hint == "@auto" {
+        if let Some(path) = resolve_bundled_image_gen_runtime(app) {
+            return Ok((path.display().to_string(), "bundled".to_owned()));
+        }
+
+        if let Some(path) = resolve_sd_cli(app) {
+            if check_image_gen_runtime(&path).is_ok() {
+                return Ok((path, "system".to_owned()));
+            }
+        }
+
+        for candidate in image_gen_runtime_candidates(None) {
+            if check_image_gen_runtime(&candidate).is_ok() {
+                return Ok((candidate, "system".to_owned()));
+            }
+        }
+
+        return Err("Nessun runtime stable-diffusion.cpp (`sd-cli`) trovato né incorporato né nel sistema".to_owned());
+    }
+
+    Ok((hint.to_owned(), "manual".to_owned()))
 }
 
 fn runtime_candidates(runtime_hint: Option<&str>) -> Vec<String> {
@@ -859,6 +1132,22 @@ fn detect_runtime_version(runtime_path: &str) -> String {
         }
         _ => "Versione non disponibile".to_owned(),
     }
+}
+
+fn validate_external_http_url(raw_url: &str) -> Result<String, String> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return Err("URL sorgente mancante".to_owned());
+    }
+
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|error| format!("URL sorgente non valido: {error}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("Sono supportati solo link http/https".to_owned());
+    }
+
+    Ok(parsed.to_string())
 }
 
 fn local_runtime_status(app: &tauri::AppHandle, runtime_hint: Option<&str>) -> LocalRuntimeStatus {
@@ -915,6 +1204,86 @@ fn local_runtime_status(app: &tauri::AppHandle, runtime_hint: Option<&str>) -> L
         suggested_command,
         error: "Runtime llama.cpp non trovato. Installa `llama-cli` o inserisci il percorso assoluto del binario.".to_owned(),
     }
+}
+
+fn model_storage_status(app: &tauri::AppHandle, payload: &ModelStoragePayload) -> Result<ModelStorageStatus, String> {
+    let root = local_models_dir(app)?;
+    let files = collect_model_files(&root)?;
+    let active_paths: std::collections::HashSet<PathBuf> = payload
+        .active_paths
+        .iter()
+        .filter_map(|path| normalized_existing_path(path))
+        .collect();
+    let active_vision_dirs: std::collections::HashSet<PathBuf> = payload
+        .active_vision_model_paths
+        .iter()
+        .filter_map(|path| normalized_existing_path(path))
+        .filter_map(|path| path.parent().map(PathBuf::from))
+        .collect();
+
+    let mut items = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut active_bytes = 0u64;
+
+    for file_path in files {
+        let normalized_path = fs::canonicalize(&file_path).unwrap_or_else(|_| file_path.clone());
+        let metadata = fs::metadata(&normalized_path)
+            .map_err(|error| format!("Impossibile leggere i metadati del modello: {error}"))?;
+        let size_bytes = metadata.len();
+        let is_mmproj = normalized_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.starts_with("mmproj-") && value.ends_with(".gguf"))
+            .unwrap_or(false);
+        let is_active = active_paths.contains(&normalized_path)
+            || (is_mmproj && normalized_path.parent().map(PathBuf::from).is_some_and(|dir| active_vision_dirs.contains(&dir)));
+
+        total_bytes += size_bytes;
+        if is_active {
+            active_bytes += size_bytes;
+        }
+
+        items.push(StoredModelFile {
+            path: normalized_path.display().to_string(),
+            name: normalized_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("modello")
+                .to_owned(),
+            size_bytes,
+            is_active,
+        });
+    }
+
+    items.sort_by(|left, right| right.size_bytes.cmp(&left.size_bytes).then_with(|| left.name.cmp(&right.name)));
+
+    Ok(ModelStorageStatus {
+        root_path: root.display().to_string(),
+        total_bytes,
+        active_bytes,
+        inactive_bytes: total_bytes.saturating_sub(active_bytes),
+        files: items,
+    })
+}
+
+fn clean_unused_model_files(app: &tauri::AppHandle, payload: &ModelStoragePayload) -> Result<CleanModelsResult, String> {
+    let status = model_storage_status(app, payload)?;
+    let mut deleted_paths = Vec::new();
+    let mut freed_bytes = 0u64;
+
+    for file in status.files.into_iter().filter(|file| !file.is_active) {
+        let path = PathBuf::from(&file.path);
+        fs::remove_file(&path)
+            .map_err(|error| format!("Impossibile eliminare {}: {error}", path.display()))?;
+        freed_bytes += file.size_bytes;
+        deleted_paths.push(file.path);
+    }
+
+    Ok(CleanModelsResult {
+        deleted_count: deleted_paths.len(),
+        freed_bytes,
+        deleted_paths,
+    })
 }
 
 fn html_decode(input: &str) -> String {
@@ -1119,6 +1488,24 @@ fn strip_html_text(html: &str) -> String {
     truncate_chars(compact_lines.trim(), 6_000)
 }
 
+fn requested_max_tokens(payload: &AiCallPayload) -> u32 {
+    let has_image = payload
+        .image_data_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+
+    if has_image {
+        return 4096;
+    }
+
+    if payload.prompt.len() > 9_000 {
+        return 3072;
+    }
+
+    2048
+}
+
 async fn call_claude(client: &Client, payload: &AiCallPayload) -> Result<String, String> {
     let content = if let Some(image_data_url) = payload
         .image_data_url
@@ -1147,7 +1534,7 @@ async fn call_claude(client: &Client, payload: &AiCallPayload) -> Result<String,
 
     let mut body = json!({
         "model": payload.model,
-        "max_tokens": 2048,
+        "max_tokens": requested_max_tokens(payload),
         "messages": [{
             "role": "user",
             "content": content,
@@ -1227,7 +1614,7 @@ async fn call_openai(client: &Client, payload: &AiCallPayload) -> Result<String,
 
     let body = json!({
         "model": model,
-        "max_tokens": 2048,
+        "max_tokens": requested_max_tokens(payload),
         "messages": [{
             "role": "user",
             "content": content,
@@ -1268,6 +1655,146 @@ async fn call_openai(client: &Client, payload: &AiCallPayload) -> Result<String,
         .unwrap_or_default())
 }
 
+async fn generate_openai_recipe_image(
+    client: &Client,
+    payload: &RecipeImagePayload,
+) -> Result<String, String> {
+    let body = json!({
+        "model": "gpt-image-1.5",
+        "prompt": payload.prompt,
+        "size": "1024x1024",
+        "quality": "medium",
+        "background": "opaque",
+        "output_format": "webp",
+        "output_compression": 80,
+    });
+
+    let response = client
+        .post("https://api.openai.com/v1/images/generations")
+        .bearer_auth(&payload.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Errore di rete OpenAI immagini: {error}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Errore leggendo la risposta OpenAI immagini: {error}"))?;
+
+    if !status.is_success() {
+        return Err(extract_error_message(
+            &body,
+            format!("OpenAI Images HTTP {}", status.as_u16()),
+        ));
+    }
+
+    let json: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Risposta OpenAI immagini non valida: {error}"))?;
+
+    let image_base64 = json
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("b64_json"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "OpenAI non ha restituito nessuna immagine".to_owned())?;
+
+    Ok(format!("data:image/webp;base64,{image_base64}"))
+}
+
+async fn generate_local_recipe_image(
+    app: &tauri::AppHandle,
+    payload: &RecipeImagePayload,
+) -> Result<String, String> {
+    let model_path = validate_local_model_path(&payload.local_model_path)?;
+    let runtime_hint = image_gen_runtime_path(payload);
+    let (runtime_path, _) = resolve_image_gen_runtime_command(app, Some(&runtime_hint))?;
+    check_image_gen_runtime(&runtime_path)?;
+
+    let prompt = payload.prompt.clone();
+    let model_path_string = model_path.to_string_lossy().to_string();
+    let model_name = model_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    let is_turbo_model = model_name.contains("turbo");
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        let output_path = std::env::temp_dir().join(format!("recipevault-generated-{ts}.png"));
+        let output_path_string = output_path.to_string_lossy().to_string();
+
+        let mut cmd = Command::new(&runtime_path);
+        cmd.arg("--mode")
+            .arg("img_gen")
+            .arg("--model")
+            .arg(&model_path_string)
+            .arg("--prompt")
+            .arg(&prompt)
+            .arg("--output")
+            .arg(&output_path_string);
+
+        if is_turbo_model {
+            cmd.arg("--steps")
+                .arg("4")
+                .arg("--cfg-scale")
+                .arg("0.0")
+                .arg("--width")
+                .arg("512")
+                .arg("--height")
+                .arg("512");
+        } else {
+            cmd.arg("--width")
+                .arg("768")
+                .arg("--height")
+                .arg("768");
+        }
+
+        let (status, stdout, stderr) = run_command_with_timeout(
+            cmd,
+            Duration::from_secs(600),
+            "La generazione immagine locale non ha risposto entro 10 minuti",
+        )?;
+
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        let detail = join_process_detail(&stdout, &stderr);
+
+        if !status.success() {
+            return Err(if detail.is_empty() {
+                "Il runtime locale per immagini ha terminato con errore".to_owned()
+            } else {
+                format!("Il runtime locale per immagini ha terminato con errore:\n{detail}")
+            });
+        }
+
+        if !output_path.exists() {
+            return Err(if detail.is_empty() {
+                "Il runtime locale non ha prodotto nessuna immagine".to_owned()
+            } else {
+                format!("Il runtime locale non ha prodotto nessuna immagine:\n{detail}")
+            });
+        }
+
+        let bytes = fs::read(&output_path)
+            .map_err(|error| format!("Impossibile leggere l'immagine generata localmente: {error}"))?;
+        let _ = fs::remove_file(&output_path);
+
+        Ok(format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(bytes)
+        ))
+    })
+    .await
+    .map_err(|error| format!("Errore nel task di generazione immagine locale: {error}"))?
+}
+
 async fn call_local(app: &tauri::AppHandle, payload: &AiCallPayload) -> Result<String, String> {
     if let Some(image_data_url) = payload
         .image_data_url
@@ -1293,7 +1820,7 @@ async fn call_local(app: &tauri::AppHandle, payload: &AiCallPayload) -> Result<S
             .arg("-m")
             .arg(&model_path_string)
             .arg("-c")
-            .arg("8192")
+            .arg("16384")
             .arg("-n")
             .arg("2048")
             .arg("--temp")
@@ -1613,73 +2140,81 @@ fn call_vision_model(
     prompt: &str,
     image_paths: &[PathBuf],
 ) -> Result<String, String> {
-    let mut cmd = Command::new(mtmd_cli_path);
-    cmd.arg("-m")
-        .arg(model_path)
-        .arg("--mmproj")
-        .arg(mmproj_path)
-        .arg("-c")
-        .arg("8192")
-        .arg("-n")
-        .arg("2048")
-        .arg("--temp")
-        .arg("0.2")
-        .arg("--single-turn")
-        .arg("--no-display-prompt")
-        .arg("--no-show-timings")
-        .arg("--log-disable")
-        .arg("--simple-io");
+    let lower_model_path = model_path.to_lowercase();
+    let is_qwen_vl = lower_model_path.contains("qwen") && lower_model_path.contains("vl");
+
+    let mut base_args = vec![
+        "-m".to_owned(),
+        model_path.to_owned(),
+        "--mmproj".to_owned(),
+        mmproj_path.to_owned(),
+        "-c".to_owned(),
+        "4096".to_owned(),
+        "-n".to_owned(),
+        "2048".to_owned(),
+        "--temp".to_owned(),
+        "0.2".to_owned(),
+        "--no-warmup".to_owned(),
+        "-lv".to_owned(),
+        "1".to_owned(),
+        "--no-log-prefix".to_owned(),
+        "--no-log-timestamps".to_owned(),
+    ];
+
+    if is_qwen_vl {
+        base_args.push("--image-min-tokens".to_owned());
+        base_args.push("1024".to_owned());
+    }
 
     for img in image_paths {
-        cmd.arg("--image").arg(img.to_string_lossy().as_ref());
+        base_args.push("--image".to_owned());
+        base_args.push(img.to_string_lossy().to_string());
     }
 
-    cmd.arg("-p").arg(prompt);
+    base_args.push("-p".to_owned());
+    base_args.push(prompt.to_owned());
 
-    let started_at = Instant::now();
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Errore avviando il modello vision: {e}"))?;
+    let primary_result = run_vision_process(mtmd_cli_path, &base_args)?;
+    if primary_result.status.success() && !primary_result.stdout.is_empty() {
+        return Ok(primary_result.stdout);
+    }
 
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(read_child_stream)
-        .ok_or_else(|| "Impossibile leggere output modello vision".to_owned())?;
+    let primary_detail = join_process_detail(&primary_result.stdout, &primary_result.stderr);
+    let should_retry_cpu = !primary_result.status.success() && is_vision_backend_init_error(&primary_detail);
 
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|e| format!("Errore monitorando modello vision: {e}"))?
-        {
-            Some(status) => break status,
-            None => {
-                if Instant::now().duration_since(started_at) > Duration::from_secs(300) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("Il modello vision non ha risposto entro 5 minuti".to_owned());
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
+    if should_retry_cpu {
+        let mut cpu_args = base_args.clone();
+        cpu_args.splice(
+            10..10,
+            [
+                "--device".to_owned(),
+                "none".to_owned(),
+                "--no-mmproj-offload".to_owned(),
+                "-ngl".to_owned(),
+                "0".to_owned(),
+                "-fit".to_owned(),
+                "off".to_owned(),
+            ],
+        );
+
+        let cpu_result = run_vision_process(mtmd_cli_path, &cpu_args)?;
+        if cpu_result.status.success() && !cpu_result.stdout.is_empty() {
+            return Ok(cpu_result.stdout);
         }
-    };
 
-    let stdout = String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default())
-        .trim()
-        .replace("<|im_end|>", "")
-        .replace("<|endoftext|>", "")
-        .replace("<end_of_turn>", "")
-        .trim()
-        .to_owned();
-
-    if !status.success() || stdout.is_empty() {
-        return Err("Il modello vision non ha prodotto output".to_owned());
+        let cpu_detail = join_process_detail(&cpu_result.stdout, &cpu_result.stderr);
+        return Err(if cpu_detail.is_empty() {
+            "Il modello vision non ha prodotto output".to_owned()
+        } else {
+            cpu_detail
+        });
     }
 
-    Ok(stdout)
+    Err(if primary_detail.is_empty() {
+        "Il modello vision non ha prodotto output".to_owned()
+    } else {
+        primary_detail
+    })
 }
 
 async fn run_local_model_download(
@@ -1832,6 +2367,14 @@ async fn run_local_model_download(
         return;
     }
 
+    // Chiudi il file handle prima del rename (necessario su alcuni filesystem)
+    drop(file);
+
+    // Assicurati che la directory di destinazione esista
+    if let Some(parent) = target_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
     if let Err(error) = fs::rename(&temp_path, &target_path) {
         let _ = fs::remove_file(&temp_path);
         set_download_status(
@@ -1932,6 +2475,55 @@ async fn call_ai(app: tauri::AppHandle, payload: AiCallPayload) -> Result<String
         "local" => call_local(&app, &payload).await,
         _ => Err("Provider AI non supportato".to_owned()),
     }
+}
+
+#[tauri::command]
+async fn generate_recipe_image(
+    app: tauri::AppHandle,
+    payload: RecipeImagePayload,
+) -> Result<String, String> {
+    if payload.provider.trim() == "local" {
+        return generate_local_recipe_image(&app, &payload).await;
+    }
+
+    let client = Client::new();
+    generate_openai_recipe_image(&client, &payload).await
+}
+
+#[tauri::command]
+async fn open_external_url(payload: ExternalUrlPayload) -> Result<bool, String> {
+    let url = validate_external_http_url(&payload.url)?;
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.arg(&url);
+        cmd
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(&url);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", &url]);
+        cmd
+    };
+
+    let status = command
+        .status()
+        .map_err(|error| format!("Impossibile aprire il link esterno: {error}"))?;
+
+    if !status.success() {
+        return Err("Il sistema non è riuscito ad aprire il link esterno".to_owned());
+    }
+
+    Ok(true)
 }
 
 #[tauri::command]
@@ -2102,6 +2694,22 @@ fn get_local_runtime_status(
 }
 
 #[tauri::command]
+fn get_model_storage_status(
+    app: tauri::AppHandle,
+    payload: ModelStoragePayload,
+) -> Result<ModelStorageStatus, String> {
+    model_storage_status(&app, &payload)
+}
+
+#[tauri::command]
+fn clean_unused_models(
+    app: tauri::AppHandle,
+    payload: ModelStoragePayload,
+) -> Result<CleanModelsResult, String> {
+    clean_unused_model_files(&app, &payload)
+}
+
+#[tauri::command]
 fn get_local_model_download_status(
     manager: tauri::State<'_, DownloadManager>,
     payload: DownloadStatusPayload,
@@ -2200,6 +2808,8 @@ fn main() {
         .manage(DownloadManager::default())
         .invoke_handler(tauri::generate_handler![
             call_ai,
+            generate_recipe_image,
+            open_external_url,
             test_api_key,
             extract_url_content,
             extract_youtube_transcript,
@@ -2207,6 +2817,8 @@ fn main() {
             extract_social_transcript,
             import_video_frames,
             get_local_runtime_status,
+            get_model_storage_status,
+            clean_unused_models,
             start_local_model_download,
             get_local_model_download_status,
             export_backup
