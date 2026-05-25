@@ -4,6 +4,19 @@ Gestore ricette standalone per macOS con import AI da qualsiasi fonte.
 
 ---
 
+## 🖼 Screenshot desktop
+
+### Libreria ricette
+![Libreria ricette desktop](docs/screenshots/desktop-home.png)
+
+### Dettaglio ricetta
+![Dettaglio ricetta desktop](docs/screenshots/desktop-detail.png)
+
+### Configurazione AI
+![Configurazione AI desktop](docs/screenshots/desktop-ai-config.png)
+
+---
+
 ## ✅ Prerequisiti (installare una volta sola)
 
 ### 1. Xcode Command Line Tools
