@@ -1,6 +1,6 @@
 # 🍽 RecipeVault — App Desktop (Tauri + React)
 
-Gestore ricette standalone per macOS con import AI da qualsiasi fonte.
+Gestore ricette standalone per macOS con shell Android, import AI da URL e foto, provider locale on-device e organizzazione del ricettario orientata all'uso quotidiano.
 
 ---
 
@@ -14,6 +14,46 @@ Gestore ricette standalone per macOS con import AI da qualsiasi fonte.
 
 ### Configurazione AI
 ![Configurazione AI desktop](docs/screenshots/desktop-ai-config.png)
+
+---
+
+## 📌 Stato implementazione
+
+Stato aggiornato a maggio 2026.
+
+### Funzioni già disponibili
+
+- Libreria ricette desktop con ricerca, categorie, filtri per ingrediente e vista dettaglio completa
+- Import da URL per siti ricette, blog, YouTube, TikTok, Instagram e Facebook
+- Import da foto del piatto o di pagine di libri/ricettari
+- Inserimento manuale e modifica ricette
+- Supporto a ricette con preparazioni separate, ad esempio `base`, `crema`, `farcitura`, `decorazione`
+- Lista della spesa generata a partire da una o più ricette selezionate
+- Ricerca testuale assistita da AI sulle ricette già salvate
+- Provider `Locale (on-device)` come default, più supporto opzionale per Claude e OpenAI
+- Pannello `Configurazione AI` con preset, download modelli, gestione spazio occupato e pulizia modelli non usati
+- `DEV MODE` sulle ricette importate, con JSON grezzo, output del modello e dati di debug
+- Apertura nativa della `Fonte originale` su desktop e Android
+
+### Stato per piattaforma
+
+| Area | Desktop Tauri | Android Studio |
+|---|---|---|
+| Libreria ricette / CRUD | ✅ Completo | ✅ Completo |
+| Importa da URL | ✅ Completo | ✅ Completo |
+| Importa da foto con provider esterni | ✅ Completo | ✅ Completo |
+| Importa da foto con provider locale | ✅ Completo con modello vision | ⚠️ Non ancora supportato |
+| Provider locale testo | ✅ Completo | ✅ Completo |
+| Provider locale vision per video | ✅ Completo | ⚠️ Limitato |
+| Generazione foto piatto in locale | ✅ Desktop-only | ❌ Non disponibile |
+| Gestione spazio modelli | ✅ Completo | ✅ Completo |
+
+### Limiti attuali
+
+- Il provider locale non usa web search esterna: per gli URL lavora sui contenuti realmente estratti dalla pagina, dai sottotitoli o dalla didascalia disponibile
+- Su Android il provider locale non supporta ancora l'analisi foto; per quella modalità usa Claude/OpenAI oppure il desktop con modello vision
+- La generazione locale della foto del piatto richiede un runtime immagini separato compatibile con `stable-diffusion.cpp`
+- Il runtime `llama.cpp` bundlettato vale per le build macOS Apple Silicon; sulle build `x86_64` e `universal` il setup locale resta più manuale
 
 ---
 
@@ -124,38 +164,42 @@ android-studio/README.md
 
 ---
 
-## 🔑 Configurazione API Key
+## ⚙️ Configurazione AI
 
-Al primo avvio l'app ti chiede di scegliere il provider AI:
+RecipeVault usa `Locale (on-device)` come provider predefinito. Dal pannello `Configurazione AI` puoi:
+
+- scegliere il provider di default per `import` e `ricerca`
+- configurare provider esterni come Claude e OpenAI
+- scaricare modelli locali testo, vision, whisper e immagine
+- verificare i runtime locali
+- controllare lo spazio occupato dai modelli e pulire quelli non usati
+
+### Provider supportati
+
+| Provider | Stato | Note |
+|---|---|---|
+| `Locale (on-device)` | ✅ Default | Testo locale, import URL, video, foto desktop con modello vision |
+| `Claude (Anthropic)` | ✅ Opzionale | Utile come fallback cloud, richiede API key |
+| `OpenAI` | ✅ Opzionale | Utile come fallback cloud, richiede API key |
+
+### API key cloud
+
+Se vuoi usare i provider cloud:
 
 | Provider | Dove ottenere la chiave | Prefisso |
 |---|---|---|
 | **Claude (Anthropic)** | https://console.anthropic.com | `sk-ant-...` |
-| **ChatGPT (OpenAI)** | https://platform.openai.com/api-keys | `sk-proj-...` |
+| **OpenAI** | https://platform.openai.com/api-keys | `sk-proj-...` |
 
-La chiave viene salvata solo in `localStorage` del tuo Mac, mai inviata altrove.
-
----
-
-## 🤖 Differenze tra i provider AI
-
-| Funzione | Claude | OpenAI |
-|---|---|---|
-| Import da siti web | ✅ `claude-sonnet` + web_search | ✅ `gpt-4o-search-preview` |
-| Import da YouTube | ✅ Ottimo | ✅ Ottimo |
-| Import da TikTok/Instagram | ✅ Con didascalia | ✅ Con didascalia |
-| Lista spesa AI | ✅ claude-sonnet | ✅ gpt-4o |
-| Modelli disponibili | Sonnet 4, Opus 4, Haiku | gpt-4o, gpt-4o-mini, gpt-4-turbo |
-
-Puoi cambiare provider in qualsiasi momento da ⚙ Impostazioni AI nella sidebar.
+Le chiavi vengono salvate localmente nelle preferenze dell'app.
 
 ---
 
 ## 💾 Dati e backup
 
-- Le ricette sono salvate in `localStorage` (persistente tra riavvii)
-- Usa **Export JSON** per fare un backup o spostare le ricette
-- Usa **Import JSON** per ripristinare un backup
+- Le ricette sono salvate in `localStorage` / storage locale dell'app
+- I modelli locali vengono scaricati fuori dal repository, nella cartella dati dell'app
+- Il pannello `Configurazione AI > Spazio modelli` mostra quanto occupano i modelli e permette di rimuovere quelli non più usati
 
 ---
 
@@ -199,6 +243,12 @@ rustup target add x86_64-apple-darwin
 
 **Errore API "invalid_api_key"**
 Controlla che la chiave non abbia spazi e che corrisponda al provider selezionato.
+
+**Su Android la foto non funziona con il provider locale**
+È un limite attuale: per `Importa da foto` usa Claude/OpenAI oppure il desktop con modello vision configurato.
+
+**La generazione foto del piatto non parte in locale**
+Controlla nel pannello `Configurazione AI` di avere configurato sia il modello immagine sia un runtime compatibile con `stable-diffusion.cpp`.
 
 ---
 
