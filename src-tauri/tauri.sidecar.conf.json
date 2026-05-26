@@ -18,12 +18,16 @@
         "MacOS/libllama-common.0.0.9251.dylib": "./binaries/libllama-common.0.0.9251.dylib",
         "MacOS/libllama.0.dylib": "./binaries/libllama.0.dylib",
         "MacOS/libllama.0.0.9251.dylib": "./binaries/libllama.0.0.9251.dylib",
+        "MacOS/libstable-diffusion.dylib": "./binaries/libstable-diffusion.dylib",
         "MacOS/libmtmd.0.dylib": "./binaries/libmtmd.0.dylib",
-        "MacOS/libmtmd.0.0.9251.dylib": "./binaries/libmtmd.0.0.9251.dylib"
+        "MacOS/libmtmd.0.0.9251.dylib": "./binaries/libmtmd.0.0.9251.dylib",
+        "MacOS/ggml-metal.metal": "./binaries/ggml-metal.metal"
       }
     },
     "externalBin": [
+      "binaries/apple-system-ai",
       "binaries/llama-cli",
+      "binaries/sd-cli",
       "binaries/llama-mtmd-cli",
       "binaries/whisper-cli",
       "binaries/yt-dlp",

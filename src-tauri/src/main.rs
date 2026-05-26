@@ -95,6 +95,13 @@ struct LocalRuntimeStatusPayload {
     runtime_path: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppleSystemAiPayload {
+    prompt: String,
+    instructions: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ModelStoragePayload {
@@ -122,6 +129,25 @@ struct LocalRuntimeStatus {
     brew_available: bool,
     suggested_command: String,
     error: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppleSystemAiStatus {
+    supported: bool,
+    available: bool,
+    source: String,
+    reason: String,
+    error: String,
+}
+
+#[derive(Deserialize)]
+struct AppleSystemAiHelperResponse {
+    ok: bool,
+    available: bool,
+    reason: Option<String>,
+    output: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -361,6 +387,10 @@ fn resolve_whisper_cli(app: &tauri::AppHandle) -> Option<String> {
 
 fn resolve_sd_cli(app: &tauri::AppHandle) -> Option<String> {
     resolve_sidecar_or_system(app, "sd-cli")
+}
+
+fn resolve_apple_system_ai_helper(app: &tauri::AppHandle) -> Option<String> {
+    resolve_sidecar_or_system(app, "apple-system-ai")
 }
 
 fn find_whisper_model(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -835,7 +865,7 @@ fn check_local_runtime(runtime_path: &str) -> Result<(), String> {
 
 fn check_image_gen_runtime(runtime_path: &str) -> Result<(), String> {
     let output = Command::new(runtime_path)
-        .arg("--help")
+        .arg("-h")
         .output()
         .map_err(|error| format!("Runtime immagini locale non disponibile ({runtime_path}): {error}"))?;
 
@@ -943,18 +973,34 @@ fn run_vision_process(mtmd_cli_path: &str, args: &[String]) -> Result<VisionProc
     })
 }
 
-fn run_command_with_timeout(
+fn run_command_with_timeout_and_input(
     mut cmd: Command,
+    stdin_bytes: Option<Vec<u8>>,
     timeout: Duration,
     timeout_message: &str,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    let use_stdin = stdin_bytes
+        .as_ref()
+        .map(|bytes| !bytes.is_empty())
+        .unwrap_or(false);
     let started_at = Instant::now();
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if use_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Errore eseguendo il comando esterno: {error}"))?;
+
+    if let Some(bytes) = stdin_bytes.filter(|bytes| !bytes.is_empty()) {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Impossibile aprire lo stdin del comando esterno".to_owned())?;
+        stdin
+            .write_all(&bytes)
+            .map_err(|error| format!("Impossibile inviare l'input al comando esterno: {error}"))?;
+        drop(stdin);
+    }
 
     let stdout_reader = child
         .stdout
@@ -989,6 +1035,58 @@ fn run_command_with_timeout(
         stdout_reader.join().unwrap_or_default(),
         stderr_reader.join().unwrap_or_default(),
     ))
+}
+
+fn run_command_with_timeout(
+    cmd: Command,
+    timeout: Duration,
+    timeout_message: &str,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    run_command_with_timeout_and_input(cmd, None, timeout, timeout_message)
+}
+
+fn run_apple_system_ai_helper(
+    app: &tauri::AppHandle,
+    request: &Value,
+    timeout: Duration,
+    timeout_message: &str,
+) -> Result<AppleSystemAiHelperResponse, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("Apple Intelligence è disponibile solo su macOS".to_owned());
+    }
+
+    let helper_path = resolve_apple_system_ai_helper(app)
+        .ok_or_else(|| "Helper Apple Foundation Models non trovato in questa build".to_owned())?;
+
+    let request_bytes = serde_json::to_vec(request)
+        .map_err(|error| format!("Impossibile serializzare la richiesta per l'AI di sistema Apple: {error}"))?;
+
+    let (status, stdout, stderr) = run_command_with_timeout_and_input(
+        Command::new(&helper_path),
+        Some(request_bytes),
+        timeout,
+        timeout_message,
+    )?;
+
+    let stdout_text = String::from_utf8_lossy(&stdout).trim().to_owned();
+    let stderr_text = String::from_utf8_lossy(&stderr).trim().to_owned();
+    let detail = join_process_detail(&stdout_text, &stderr_text);
+
+    if !status.success() {
+        return Err(if detail.is_empty() {
+            "L'helper Apple Foundation Models ha terminato con errore".to_owned()
+        } else {
+            format!("L'helper Apple Foundation Models ha terminato con errore:\n{detail}")
+        });
+    }
+
+    serde_json::from_str::<AppleSystemAiHelperResponse>(&stdout_text).map_err(|error| {
+        if detail.is_empty() {
+            format!("Risposta non valida dall'AI di sistema Apple: {error}")
+        } else {
+            format!("Risposta non valida dall'AI di sistema Apple: {error}\n{detail}")
+        }
+    })
 }
 
 fn resolve_bundled_runtime(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -1203,6 +1301,164 @@ fn local_runtime_status(app: &tauri::AppHandle, runtime_hint: Option<&str>) -> L
         brew_available: brew,
         suggested_command,
         error: "Runtime llama.cpp non trovato. Installa `llama-cli` o inserisci il percorso assoluto del binario.".to_owned(),
+    }
+}
+
+fn image_gen_runtime_status(app: &tauri::AppHandle, runtime_hint: Option<&str>) -> LocalRuntimeStatus {
+    let brew = brew_available();
+    let normalized_hint = normalize_image_gen_runtime_hint(runtime_hint);
+
+    if matches!(normalized_hint.as_str(), "@bundled" | "@auto") {
+        if let Some(path) = resolve_bundled_image_gen_runtime(app) {
+            return LocalRuntimeStatus {
+                found: true,
+                source: "bundled".to_owned(),
+                resolved_path: path.display().to_string(),
+                version: detect_runtime_version(&path.display().to_string()),
+                brew_available: brew,
+                suggested_command: String::new(),
+                error: String::new(),
+            };
+        }
+
+        if normalized_hint == "@bundled" {
+            return LocalRuntimeStatus {
+                found: false,
+                source: String::new(),
+                resolved_path: String::new(),
+                version: String::new(),
+                brew_available: brew,
+                suggested_command: String::new(),
+                error: "Runtime immagini incorporato non trovato in questa build desktop".to_owned(),
+            };
+        }
+    }
+
+    if let Some(path) = resolve_sd_cli(app) {
+        if check_image_gen_runtime(&path).is_ok() {
+            return LocalRuntimeStatus {
+                found: true,
+                source: "system".to_owned(),
+                resolved_path: path.clone(),
+                version: detect_runtime_version(&path),
+                brew_available: brew,
+                suggested_command: String::new(),
+                error: String::new(),
+            };
+        }
+    }
+
+    for candidate in image_gen_runtime_candidates(runtime_hint) {
+        if check_image_gen_runtime(&candidate).is_ok() {
+            return LocalRuntimeStatus {
+                found: true,
+                source: "system".to_owned(),
+                resolved_path: candidate.clone(),
+                version: detect_runtime_version(&candidate),
+                brew_available: brew,
+                suggested_command: String::new(),
+                error: String::new(),
+            };
+        }
+    }
+
+    LocalRuntimeStatus {
+        found: false,
+        source: String::new(),
+        resolved_path: String::new(),
+        version: String::new(),
+        brew_available: brew,
+        suggested_command: String::new(),
+        error: "Runtime stable-diffusion.cpp non trovato. Hai scaricato il modello, ma serve anche il binario `sd-cli` (release ufficiale o percorso assoluto).".to_owned(),
+    }
+}
+
+fn apple_system_ai_status(app: &tauri::AppHandle) -> AppleSystemAiStatus {
+    if !cfg!(target_os = "macos") {
+        return AppleSystemAiStatus {
+            supported: false,
+            available: false,
+            source: "apple".to_owned(),
+            reason: "AI di sistema Apple disponibile solo su macOS.".to_owned(),
+            error: String::new(),
+        };
+    }
+
+    let availability = match run_apple_system_ai_helper(
+        app,
+        &json!({ "mode": "status" }),
+        Duration::from_secs(10),
+        "Timeout verificando la disponibilità dell'AI di sistema Apple.",
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            return AppleSystemAiStatus {
+                supported: true,
+                available: false,
+                source: "apple".to_owned(),
+                reason: String::new(),
+                error,
+            };
+        }
+    };
+
+    if !availability.available {
+        return AppleSystemAiStatus {
+            supported: true,
+            available: false,
+            source: "apple".to_owned(),
+            reason: availability
+                .reason
+                .unwrap_or_else(|| "Apple Intelligence non disponibile su questa macchina.".to_owned()),
+            error: availability.error.unwrap_or_default(),
+        };
+    }
+
+    match run_apple_system_ai_helper(
+        app,
+        &json!({
+            "mode": "complete",
+            "instructions": "Rispondi solo con OK.",
+            "prompt": "OK"
+        }),
+        Duration::from_secs(20),
+        "Timeout durante il test operativo dell'AI di sistema Apple.",
+    ) {
+        Ok(response) => {
+            let has_output = response
+                .output
+                .as_deref()
+                .map(str::trim)
+                .map(|text| !text.is_empty())
+                .unwrap_or(false);
+
+            if response.ok && has_output {
+                AppleSystemAiStatus {
+                    supported: true,
+                    available: true,
+                    source: "apple".to_owned(),
+                    reason: "Foundation Models operativo su questo Mac.".to_owned(),
+                    error: String::new(),
+                }
+            } else {
+                AppleSystemAiStatus {
+                    supported: true,
+                    available: false,
+                    source: "apple".to_owned(),
+                    reason: response.reason.unwrap_or_default(),
+                    error: response
+                        .error
+                        .unwrap_or_else(|| "Il modello Apple risulta disponibile, ma il test operativo non è riuscito.".to_owned()),
+                }
+            }
+        }
+        Err(error) => AppleSystemAiStatus {
+            supported: true,
+            available: false,
+            source: "apple".to_owned(),
+            reason: String::new(),
+            error,
+        },
     }
 }
 
@@ -2694,6 +2950,68 @@ fn get_local_runtime_status(
 }
 
 #[tauri::command]
+fn get_apple_system_ai_status(app: tauri::AppHandle) -> Result<AppleSystemAiStatus, String> {
+    Ok(apple_system_ai_status(&app))
+}
+
+#[tauri::command]
+async fn call_apple_system_ai(
+    app: tauri::AppHandle,
+    payload: AppleSystemAiPayload,
+) -> Result<String, String> {
+    let prompt = payload.prompt.trim().to_owned();
+    if prompt.is_empty() {
+        return Err("Prompt vuoto per l'AI di sistema Apple".to_owned());
+    }
+
+    let instructions = payload
+        .instructions
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let response = run_apple_system_ai_helper(
+            &app,
+            &json!({
+                "mode": "complete",
+                "instructions": instructions,
+                "prompt": prompt,
+            }),
+            Duration::from_secs(45),
+            "Timeout durante l'esecuzione dell'AI di sistema Apple.",
+        )?;
+
+        if response.ok {
+            let output = response.output.unwrap_or_default().trim().to_owned();
+            if output.is_empty() {
+                Err("L'AI di sistema Apple non ha restituito testo utile".to_owned())
+            } else {
+                Ok(output)
+            }
+        } else {
+            Err(
+                response
+                    .error
+                    .or(response.reason)
+                    .unwrap_or_else(|| "L'AI di sistema Apple non è riuscita a completare il task".to_owned()),
+            )
+        }
+    })
+    .await
+    .map_err(|error| format!("Errore nel task AI di sistema Apple: {error}"))?
+}
+
+#[tauri::command]
+fn get_image_gen_runtime_status(
+    app: tauri::AppHandle,
+    payload: LocalRuntimeStatusPayload,
+) -> Result<LocalRuntimeStatus, String> {
+    Ok(image_gen_runtime_status(&app, payload.runtime_path.as_deref()))
+}
+
+#[tauri::command]
 fn get_model_storage_status(
     app: tauri::AppHandle,
     payload: ModelStoragePayload,
@@ -2817,6 +3135,9 @@ fn main() {
             extract_social_transcript,
             import_video_frames,
             get_local_runtime_status,
+            get_apple_system_ai_status,
+            call_apple_system_ai,
+            get_image_gen_runtime_status,
             get_model_storage_status,
             clean_unused_models,
             start_local_model_download,

@@ -173,6 +173,10 @@ const AI_PROVIDERS = {
   },
 };
 
+const BUILTIN_SIMPLE_AI_PROVIDER = "__builtin_simple_ai__";
+const BUILTIN_SIMPLE_AI_MODEL = "system-simple";
+const BUILTIN_SIMPLE_AI_INSTRUCTIONS = "Sei l'assistente integrato di RecipeVault. Gestisci solo task semplici di ricerca, organizzazione e aggregazione ingredienti. Segui rigorosamente il formato richiesto nel prompt e non aggiungere testo extra.";
+
 const LOCAL_MODEL_DOWNLOADS = {
   desktop: {
     "gemma-3n-e4b": {
@@ -279,6 +283,7 @@ function createDefaultAiPrefs() {
     lastProvider: "local",
     importProvider: "local",
     searchProvider: "local",
+    preferSystemSimpleAi: true,
     visionModelPath: "",
     imageGenModelPath: "",
     imageGenRuntimePath: "@auto",
@@ -316,6 +321,7 @@ function migrateAiPrefs(savedPrefs, legacyConfig) {
     lastProvider: base.lastProvider,
     importProvider: base.importProvider,
     searchProvider: base.searchProvider,
+    preferSystemSimpleAi: base.preferSystemSimpleAi,
     visionModelPath: base.visionModelPath,
     imageGenModelPath: base.imageGenModelPath,
     imageGenRuntimePath: base.imageGenRuntimePath,
@@ -351,6 +357,9 @@ function migrateAiPrefs(savedPrefs, legacyConfig) {
     }
     if (AI_PROVIDERS[savedPrefs.searchProvider]) {
       merged.searchProvider = savedPrefs.searchProvider;
+    }
+    if (typeof savedPrefs.preferSystemSimpleAi === "boolean") {
+      merged.preferSystemSimpleAi = savedPrefs.preferSystemSimpleAi;
     }
 
     // Migrate visionModelPath to root level (shared across providers)
@@ -489,6 +498,110 @@ function hasNativeBridge() {
     window.__TAURI_INTERNALS__?.invoke ??
     (typeof window.AndroidBridge?.invoke === "function")
   );
+}
+
+function supportsChromeBuiltInAi() {
+  const languageModel = window.LanguageModel;
+  return Boolean(
+    languageModel &&
+    typeof languageModel.availability === "function" &&
+    typeof languageModel.create === "function"
+  );
+}
+
+function hasAppleSystemAiBridge() {
+  return hasNativeBridge() && typeof window.AndroidBridge?.invoke !== "function";
+}
+
+async function getChromeBuiltInAiStatus() {
+  if (!supportsChromeBuiltInAi()) {
+    return {
+      supported: false,
+      available: false,
+      source: "chrome",
+      availability: "unsupported",
+      error: "",
+      reason: "Prompt API non disponibile in questo browser.",
+    };
+  }
+
+  try {
+    const availability = await window.LanguageModel.availability();
+    return {
+      supported: true,
+      available: availability === "available",
+      source: "chrome",
+      availability,
+      error: "",
+      reason: availability === "available"
+        ? ""
+        : availability === "downloading"
+          ? "Il modello integrato di Chrome è ancora in download."
+          : availability === "downloadable"
+            ? "Il modello integrato di Chrome può essere scaricato al primo utilizzo."
+            : "Il Prompt API di Chrome non è pronto su questa macchina.",
+    };
+  } catch (error) {
+    return {
+      supported: true,
+      available: false,
+      source: "chrome",
+      availability: "error",
+      error: getErrorMessage(error),
+      reason: "Impossibile verificare il Prompt API di Chrome.",
+    };
+  }
+}
+
+async function callChromeBuiltInAi(prompt, instructions = BUILTIN_SIMPLE_AI_INSTRUCTIONS) {
+  if (!supportsChromeBuiltInAi()) {
+    throw new Error("Prompt API di Chrome non disponibile");
+  }
+
+  const initialPrompts = instructions
+    ? [{ role: "system", content: instructions }]
+    : [];
+  const session = await window.LanguageModel.create({ initialPrompts });
+
+  try {
+    return await session.prompt(prompt);
+  } finally {
+    if (typeof session.destroy === "function") {
+      try {
+        session.destroy();
+      } catch {
+        // Ignore destroy errors from experimental browser APIs.
+      }
+    }
+  }
+}
+
+async function getAppleSystemAiStatus() {
+  if (!hasAppleSystemAiBridge()) {
+    return {
+      supported: false,
+      available: false,
+      source: "apple",
+      error: "",
+      reason: "AI di sistema Apple non disponibile in questo ambiente.",
+    };
+  }
+
+  return invokeNative("get_apple_system_ai_status", { payload: {} });
+}
+
+async function callAppleSystemAi(prompt, instructions = BUILTIN_SIMPLE_AI_INSTRUCTIONS) {
+  if (!hasAppleSystemAiBridge()) {
+    throw new Error("AI di sistema Apple non disponibile");
+  }
+
+  return invokeNative("call_apple_system_ai", {
+    payload: { prompt, instructions },
+  });
+}
+
+function isSystemSimpleAiAvailableStatus(status) {
+  return Boolean(status?.chrome?.available || status?.apple?.available);
 }
 
 // ─── Source detection ─────────────────────────────────────────────────────────
@@ -1243,6 +1356,26 @@ function extractPreparationHints({ caption = "", transcript = "", extracted = nu
 
 // ─── AI Caller ────────────────────────────────────────────────────────────────
 async function callAI({ provider, apiKey, model, prompt, useWebSearch = true, localOptions = null, imageDataUrl = "" }) {
+  if (provider === BUILTIN_SIMPLE_AI_PROVIDER) {
+    const chromeStatus = await getChromeBuiltInAiStatus();
+    if (chromeStatus.available) {
+      return callChromeBuiltInAi(prompt);
+    }
+
+    const appleStatus = await getAppleSystemAiStatus();
+    if (appleStatus.available) {
+      return callAppleSystemAi(prompt);
+    }
+
+    throw new Error(
+      chromeStatus.error ||
+      chromeStatus.reason ||
+      appleStatus.error ||
+      appleStatus.reason ||
+      "Nessun modello AI di sistema disponibile per i task semplici."
+    );
+  }
+
   return invokeNative("call_ai", {
     payload: { provider, apiKey, model, prompt, useWebSearch, localOptions, imageDataUrl },
   });
@@ -1729,6 +1862,10 @@ async function getLocalRuntimeStatus(runtimePath = "") {
   return invokeNative("get_local_runtime_status", { payload: { runtimePath } });
 }
 
+async function getImageGenRuntimeStatus(runtimePath = "") {
+  return invokeNative("get_image_gen_runtime_status", { payload: { runtimePath } });
+}
+
 async function getLocalAndroidModelStatus(model = "") {
   return invokeNative("get_local_android_model_status", { payload: { model } });
 }
@@ -2051,28 +2188,55 @@ async function importFromPhoto({
   return { recipe: rec, debugData: buildDebug(rec) };
 }
 
-async function buildShoppingList({ provider, apiKey, model, recipes, localModelPath, localRuntimePath }) {
+async function buildShoppingList({ provider, apiKey, model, recipes, localModelPath, localRuntimePath, preferSystemSimpleAi = false }) {
   const prompt = buildShoppingPrompt(recipes);
+  const localOptions = isLocalProvider(provider)
+    ? { modelPath: localModelPath, runtimePath: localRuntimePath }
+    : null;
+  const schema = `{"items":[{"ingrediente":"","quantita":"","reparto":"Frigo|Frutta & Verdura|Pasta & Riso|Carne & Pesce|Latticini|Dispensa|Altro"}]}`;
+
+  if (preferSystemSimpleAi) {
+    try {
+      const builtInTxt = await callAI({
+        provider: BUILTIN_SIMPLE_AI_PROVIDER,
+        apiKey: "",
+        model: BUILTIN_SIMPLE_AI_MODEL,
+        prompt,
+        useWebSearch: false,
+      });
+
+      return await parseStructuredResponse({
+        txt: builtInTxt,
+        provider: BUILTIN_SIMPLE_AI_PROVIDER,
+        apiKey: "",
+        model: BUILTIN_SIMPLE_AI_MODEL,
+        schema,
+        label: "lista della spesa",
+        localOptions: null,
+        prompt,
+      });
+    } catch (error) {
+      console.warn("[OR-SYSTEM-AI] Fallback lista della spesa:", error);
+    }
+  }
+
   const txt = await callAI({
     provider,
     apiKey,
     model,
     prompt,
     useWebSearch: false,
-    localOptions: isLocalProvider(provider)
-      ? { modelPath: localModelPath, runtimePath: localRuntimePath }
-      : null,
+    localOptions,
   });
+
   return parseStructuredResponse({
     txt,
     provider,
     apiKey,
     model,
-    schema: `{"items":[{"ingrediente":"","quantita":"","reparto":"Frigo|Frutta & Verdura|Pasta & Riso|Carne & Pesce|Latticini|Dispensa|Altro"}]}`,
+    schema,
     label: "lista della spesa",
-    localOptions: isLocalProvider(provider)
-      ? { modelPath: localModelPath, runtimePath: localRuntimePath }
-      : null,
+    localOptions,
     prompt,
   });
 }
@@ -2515,6 +2679,10 @@ export default function App() {
   const [runtimeStatus, setRuntimeStatus] = useState(null);
   const [checkingRuntime, setCheckingRuntime] = useState(false);
   const [copiedInstallCmd, setCopiedInstallCmd] = useState(false);
+  const [imageGenRuntimeStatus, setImageGenRuntimeStatus] = useState(null);
+  const [checkingImageGenRuntime, setCheckingImageGenRuntime] = useState(false);
+  const [systemSimpleAiStatus, setSystemSimpleAiStatus] = useState({ chrome: null, apple: null });
+  const [checkingSystemSimpleAi, setCheckingSystemSimpleAi] = useState(false);
   const [androidBundledModelStatus, setAndroidBundledModelStatus] = useState(null);
   const [checkingAndroidBundledModel, setCheckingAndroidBundledModel] = useState(false);
   const [modelStorageStatus, setModelStorageStatus] = useState(null);
@@ -2527,6 +2695,9 @@ export default function App() {
   const [err, setErr]         = useState("");
   const [confirmDialog, setConfirmDialog] = useState(null);
   const [recipePickerDialog, setRecipePickerDialog] = useState(null); // { recipes, debugData, photoPreview, onPick }
+  const [recipeImageDialog, setRecipeImageDialog] = useState(null); // { status, title, message, canOpenConfig }
+  const [photoViewer, setPhotoViewer] = useState(null); // { src, title }
+  const [photoViewerScale, setPhotoViewerScale] = useState(1);
   const [selMode, setSelMode] = useState(false);
   const [sel, setSel]         = useState([]);
   const [listName, setListName] = useState("");
@@ -2540,6 +2711,7 @@ export default function App() {
   const activeImportRequestRef = useRef(0);
   const cancelledImportRequestRef = useRef(null);
   const loadMsgTimeoutRef = useRef(null);
+  const photoViewerViewportRef = useRef(null);
 
   const toggleImperial = () => {
     setUseImperial(prev => {
@@ -2575,6 +2747,9 @@ export default function App() {
   const searchAiConfig = getAiConfig(aiPrefs, searchProviderKey);
   const activeProvider = AI_PROVIDERS[searchAiConfig.provider];
   const activeAiReady = isProviderConfigured(searchAiConfig);
+  const systemSimpleAiEnabled = aiPrefs.preferSystemSimpleAi !== false;
+  const systemSimpleAiAvailable = systemSimpleAiEnabled && isSystemSimpleAiAvailableStatus(systemSimpleAiStatus);
+  const simpleTaskAiReady = activeAiReady || systemSimpleAiAvailable;
   const isAndroidShell = typeof window.AndroidBridge?.invoke === "function";
   const isCompactUi = isAndroidShell || viewportWidth <= 920;
   const pageTitle = view==="home" ? (cat==="Tutte" ? "Tutte le ricette" : cat) : "Liste della spesa";
@@ -2609,6 +2784,44 @@ export default function App() {
     if (!activeRec) setDevModeOpen(false);
     setScaleFactor(1);
   }, [activeRec]);
+
+  useEffect(() => {
+    if (!photoViewer) return undefined;
+
+    const onKeyDown = event => {
+      if (event.key === "Escape") {
+        setPhotoViewer(null);
+        setPhotoViewerScale(1);
+      } else if (event.key === "+" || event.key === "=") {
+        setPhotoViewerScale(prev => Math.min(4, +(prev + 0.25).toFixed(2)));
+      } else if (event.key === "-") {
+        setPhotoViewerScale(prev => Math.max(1, +(prev - 0.25).toFixed(2)));
+      } else if (event.key === "0") {
+        setPhotoViewerScale(1);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [photoViewer]);
+
+  useEffect(() => {
+    if (!photoViewer || !photoViewerViewportRef.current) return undefined;
+
+    const viewport = photoViewerViewportRef.current;
+    const onWheel = event => {
+      event.preventDefault();
+      event.stopPropagation();
+      setPhotoViewerScale(prev => {
+        const delta = event.deltaY > 0 ? -0.12 : 0.12;
+        const next = +(prev + delta).toFixed(2);
+        return Math.min(4, Math.max(1, next));
+      });
+    };
+
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
+  }, [photoViewer]);
 
   useEffect(() => {
     if (!localDownloadId) return undefined;
@@ -2804,6 +3017,19 @@ export default function App() {
   }, [isAndroidShell, modal, importProvider, importModel]);
 
   useEffect(() => {
+    if (!systemSimpleAiEnabled) {
+      setSystemSimpleAiStatus({ chrome: null, apple: null });
+      return;
+    }
+    refreshSystemSimpleAiStatus();
+  }, [systemSimpleAiEnabled, isAndroidShell]);
+
+  useEffect(() => {
+    if (isAndroidShell || modal !== "ai-config" || aiConfigTab !== "settings") return;
+    detectImageGenRuntime({ runtimePath: sharedImageGenRuntimePath, applyResolvedPath: true });
+  }, [isAndroidShell, modal, aiConfigTab]);
+
+  useEffect(() => {
     if (modal !== "ai-config" || aiConfigTab !== "storage") return;
     refreshModelStorage();
   }, [modal, aiConfigTab, aiPrefs, isAndroidShell]);
@@ -2911,6 +3137,24 @@ export default function App() {
     setView("home");
   };
 
+  const openPhotoViewer = (src, title = "") => {
+    if (!src) return;
+    setPhotoViewer({ src, title });
+    setPhotoViewerScale(1);
+  };
+
+  const closePhotoViewer = () => {
+    setPhotoViewer(null);
+    setPhotoViewerScale(1);
+  };
+
+  const zoomPhotoViewer = delta => {
+    setPhotoViewerScale(prev => {
+      const next = +(prev + delta).toFixed(2);
+      return Math.min(4, Math.max(1, next));
+    });
+  };
+
   const openImportModal = (mode = "url") => {
     const importConfig = defaultImportAiConfig;
     setImportMode(mode);
@@ -2956,6 +3200,35 @@ export default function App() {
     }
   };
 
+  const detectImageGenRuntime = async ({ runtimePath = sharedImageGenRuntimePath, applyResolvedPath = false } = {}) => {
+    if (isAndroidShell) return;
+
+    setCheckingImageGenRuntime(true);
+    try {
+      const status = await getImageGenRuntimeStatus(normalizeImageGenRuntimePath(runtimePath));
+      setImageGenRuntimeStatus(status);
+      if (applyResolvedPath && status?.found && status.resolvedPath) {
+        const nextValue = status.source === "bundled" ? "@bundled" : status.resolvedPath;
+        setSharedImageGenRuntimePath(nextValue);
+        updateAiPrefs(prevPrefs => ({
+          ...prevPrefs,
+          imageGenRuntimePath: normalizeImageGenRuntimePath(nextValue),
+        }));
+      }
+    } catch (error) {
+      setImageGenRuntimeStatus({
+        found: false,
+        resolvedPath: "",
+        version: "",
+        brewAvailable: false,
+        suggestedCommand: "",
+        error: error.message,
+      });
+    } finally {
+      setCheckingImageGenRuntime(false);
+    }
+  };
+
   const copyInstallCommand = async command => {
     try {
       await copyToClipboard(command);
@@ -2985,6 +3258,27 @@ export default function App() {
       });
     } finally {
       setCheckingAndroidBundledModel(false);
+    }
+  };
+
+  const refreshSystemSimpleAiStatus = async () => {
+    if (!systemSimpleAiEnabled) return;
+
+    setCheckingSystemSimpleAi(true);
+    try {
+      const [chrome, apple] = await Promise.all([
+        getChromeBuiltInAiStatus(),
+        getAppleSystemAiStatus().catch(error => ({
+          supported: hasAppleSystemAiBridge(),
+          available: false,
+          source: "apple",
+          error: getErrorMessage(error),
+          reason: "Impossibile verificare l'AI di sistema Apple.",
+        })),
+      ]);
+      setSystemSimpleAiStatus({ chrome, apple });
+    } finally {
+      setCheckingSystemSimpleAi(false);
     }
   };
 
@@ -3243,8 +3537,8 @@ export default function App() {
       return;
     }
 
-    if (!activeAiReady) {
-      setErr("Configura prima il provider predefinito della ricerca AI nel pannello Configurazione AI.");
+    if (!simpleTaskAiReady) {
+      setErr("Configura il provider predefinito della ricerca AI oppure attiva un modello AI di sistema disponibile nel pannello Configurazione AI.");
       return;
     }
 
@@ -3257,25 +3551,54 @@ export default function App() {
 
     try {
       const prompt = buildAiRecipeSearchPrompt(trimmedQuery, recipes);
-      const txt = await callAI({
-        provider: searchAiConfig.provider,
-        apiKey: searchAiConfig.apiKey,
-        model: searchAiConfig.model,
-        prompt,
-        useWebSearch: false,
-        localOptions,
-      });
+      let result;
 
-      const result = await parseStructuredResponse({
-        txt,
-        provider: searchAiConfig.provider,
-        apiKey: searchAiConfig.apiKey,
-        model: searchAiConfig.model,
-        schema: AI_RECIPE_SEARCH_SCHEMA,
-        label: "ricerca ricette",
-        localOptions,
-        prompt,
-      });
+      if (systemSimpleAiAvailable) {
+        try {
+          const builtInTxt = await callAI({
+            provider: BUILTIN_SIMPLE_AI_PROVIDER,
+            apiKey: "",
+            model: BUILTIN_SIMPLE_AI_MODEL,
+            prompt,
+            useWebSearch: false,
+          });
+
+          result = await parseStructuredResponse({
+            txt: builtInTxt,
+            provider: BUILTIN_SIMPLE_AI_PROVIDER,
+            apiKey: "",
+            model: BUILTIN_SIMPLE_AI_MODEL,
+            schema: AI_RECIPE_SEARCH_SCHEMA,
+            label: "ricerca ricette",
+            localOptions: null,
+            prompt,
+          });
+        } catch (error) {
+          console.warn("[OR-SYSTEM-AI] Fallback ricerca ricette:", error);
+        }
+      }
+
+      if (!result) {
+        const txt = await callAI({
+          provider: searchAiConfig.provider,
+          apiKey: searchAiConfig.apiKey,
+          model: searchAiConfig.model,
+          prompt,
+          useWebSearch: false,
+          localOptions,
+        });
+
+        result = await parseStructuredResponse({
+          txt,
+          provider: searchAiConfig.provider,
+          apiKey: searchAiConfig.apiKey,
+          model: searchAiConfig.model,
+          schema: AI_RECIPE_SEARCH_SCHEMA,
+          label: "ricerca ricette",
+          localOptions,
+          prompt,
+        });
+      }
 
       const validIds = [...new Set((result.matchedIds || []).map(id => Number(id)).filter(id =>
         Number.isFinite(id) && recipes.some(recipe => recipe.id === id)
@@ -3698,18 +4021,22 @@ export default function App() {
 
   const doCreateList = async () => {
     if (!sel.length) { setErr("Seleziona almeno una ricetta"); return; }
-    if (requiresApiKey(searchAiConfig.provider) && !searchAiConfig.apiKey.trim()) {
+    if (!simpleTaskAiReady) {
+      setErr("Configura il provider AI della ricerca oppure abilita un modello AI di sistema nel pannello Configurazione AI.");
+      return;
+    }
+    if (!systemSimpleAiAvailable && requiresApiKey(searchAiConfig.provider) && !searchAiConfig.apiKey.trim()) {
       setErr("Configura prima il provider AI nel pannello Configurazione AI.");
       return;
     }
-    if (isLocalProvider(searchAiConfig.provider) && !searchAiConfig.localModelPath.trim()) {
+    if (!systemSimpleAiAvailable && isLocalProvider(searchAiConfig.provider) && !searchAiConfig.localModelPath.trim()) {
       setErr("Configura prima il modello locale nel pannello Configurazione AI.");
       return;
     }
     setErr(""); setLoading(true); setLoadMsg("🛒 Genero la lista della spesa…");
     try {
       const chosen = recipes.filter(r => sel.includes(r.id));
-      const data   = await buildShoppingList({ ...searchAiConfig, recipes: chosen });
+      const data   = await buildShoppingList({ ...searchAiConfig, recipes: chosen, preferSystemSimpleAi: systemSimpleAiAvailable });
       const newList = { id: Date.now(), nome: listName || "Lista " + new Date().toLocaleDateString("it"),
         items: data.items.map(i => ({ ...i, id: Math.random(), done: false })),
         ricette: chosen.map(r => r.titolo), createdAt: new Date().toISOString() };
@@ -3765,24 +4092,38 @@ export default function App() {
   };
 
   const generateBookRecipeImage = async (recipe) => {
+    if (recipeImageDialog?.status === "loading") return;
+
     if (isAndroidShell) {
-      setErr("La generazione immagine locale non è ancora supportata su Android. Per ora usa la versione desktop.");
+      setRecipeImageDialog({
+        status: "error",
+        title: "Generazione locale non disponibile",
+        message: "La generazione immagine locale non è ancora supportata su Android. Per ora usa la versione desktop.",
+        canOpenConfig: false,
+      });
       return;
     }
 
     const localImageGenConfig = getSharedImageGenerationConfig(aiPrefs);
     if (!localImageGenConfig.modelPath.trim()) {
-      setErr("Configura il modello locale di generazione immagini nel pannello AI.");
-      openAiConfigModal({ provider: "local" });
+      setRecipeImageDialog({
+        status: "error",
+        title: "Configura la generazione immagini",
+        message: "Configura prima il modello locale di generazione immagini nel pannello AI.",
+        canOpenConfig: true,
+      });
       return;
     }
 
     const imagePrompt = buildRecipeImagePrompt(recipe);
     const modelFileName = localImageGenConfig.modelPath.split(/[\\/]/).pop() || "modello-locale";
     setErr("");
-    setLoading(true);
-    setLoadingContext("recipe-image-generation");
-    setLoadMsg("🖼️ Genero una foto locale del piatto…");
+    setRecipeImageDialog({
+      status: "loading",
+      title: "Genero la foto del piatto",
+      message: "🖼️ Genero una foto locale del piatto…",
+      canOpenConfig: false,
+    });
 
     try {
       const imageDataUrl = await generateRecipeImage({
@@ -3816,11 +4157,18 @@ export default function App() {
       persist(updatedRecipes);
       const nextActive = updatedRecipes.find(item => item.id === recipe.id) || recipe;
       setActiveRec(nextActive);
+      setRecipeImageDialog(null);
     } catch (error) {
-      setErr(`Errore generando la foto: ${getErrorMessage(error)}`);
-    } finally {
-      setLoading(false);
-      setLoadingContext(null);
+      const message = getErrorMessage(error);
+      const isMissingImageRuntime = message.includes("Nessun runtime stable-diffusion.cpp");
+      setRecipeImageDialog({
+        status: "error",
+        title: "Generazione non riuscita",
+        message: isMissingImageRuntime
+          ? "Hai scaricato il modello immagini, ma manca ancora il runtime `sd-cli` di stable-diffusion.cpp. Apri la configurazione AI, controlla il blocco `Generazione immagini locale` e installa o indica il binario del runtime."
+          : `Errore generando la foto: ${message}`,
+        canOpenConfig: true,
+      });
     }
   };
 
@@ -3918,8 +4266,34 @@ export default function App() {
               : (r.fonte ? <span style={{ ...S.sourceLink, color:"#8E8475" }}>📄 {r.fonte}</span> : null)}
           </div>
           {r.foto && (
-            <div style={{ borderRadius:isCompactUi ? 20 : 12, overflow:"hidden", marginBottom:isCompactUi ? 16 : 20, maxHeight:isCompactUi ? 240 : 300 }}>
-              <img src={r.foto} alt={r.titolo} style={{ width:"100%", maxHeight:isCompactUi ? 240 : 300, objectFit:"cover" }} onError={e=>e.target.parentElement.style.display="none"}/>
+            <div
+              style={{
+                borderRadius:isCompactUi ? 20 : 12,
+                overflow:"hidden",
+                marginBottom:isCompactUi ? 16 : 20,
+                background:"#F5F0E8",
+                border:"1px solid rgba(255,255,255,0.45)",
+                boxShadow:"0 10px 28px rgba(0,0,0,0.08)",
+                cursor:"zoom-in",
+              }}
+              onClick={() => openPhotoViewer(r.foto, r.titolo)}
+              title="Apri foto"
+            >
+              <img
+                src={r.foto}
+                alt={r.titolo}
+                style={{
+                  width:"100%",
+                  maxHeight:isCompactUi ? 300 : 420,
+                  objectFit:"contain",
+                  display:"block",
+                  background:"#F5F0E8",
+                }}
+                onError={e=>e.target.parentElement.style.display="none"}
+              />
+              <div style={{ padding:"10px 12px", fontSize:12, color:"#7A7062", textAlign:"center", borderTop:"1px solid rgba(224,216,200,0.8)" }}>
+                Tocca per aprire la foto intera
+              </div>
             </div>
           )}
           <div style={{ fontSize:isCompactUi ? 30 : 36, marginBottom:8 }}>{EMO[r.categoria]}</div>
@@ -4226,6 +4600,7 @@ export default function App() {
             onChange={e => {
               const nextValue = e.target.value;
               setSharedImageGenRuntimePath(nextValue);
+              setImageGenRuntimeStatus(null);
               updateAiPrefs(prevPrefs => ({
                 ...prevPrefs,
                 imageGenRuntimePath: normalizeImageGenRuntimePath(nextValue),
@@ -4237,7 +4612,7 @@ export default function App() {
             Usa un runtime compatibile con <strong>stable-diffusion.cpp</strong> (`sd-cli`) e un modello locale supportato dal runtime. Questo blocco serve per generare una foto del piatto a partire dalla ricetta importata da libro.
           </p>
           <p style={{ fontSize:12, color:"#888", marginTop:5, lineHeight:1.5 }}>
-            Lascia <strong>@auto</strong> per cercare `sd-cli` nel sistema o in un eventuale sidecar futuro. Su Android questa funzione locale non è ancora supportata.
+            Lascia <strong>@auto</strong> per usare prima il runtime incorporato nella build desktop, oppure quello di sistema se disponibile. Su Android questa funzione locale non è ancora supportata.
           </p>
           <div style={{ marginTop:10, display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
             <button
@@ -4252,6 +4627,36 @@ export default function App() {
             <span style={{ fontSize:12, color:"#888" }}>
               {LOCAL_MODEL_DOWNLOADS.imageGen.sizeLabel} · {LOCAL_MODEL_DOWNLOADS.imageGen.note}
             </span>
+          </div>
+          <div style={{ marginTop:10, display:"flex", gap:8, flexWrap:"wrap" }}>
+            <button
+              style={{ ...S.btnSecondary, ...(isCompactUi ? { width:"100%", justifyContent:"center", padding:"13px 16px", borderRadius:14 } : {}) }}
+              onClick={() => detectImageGenRuntime({ runtimePath: sharedImageGenRuntimePath, applyResolvedPath: true })}
+              disabled={checkingImageGenRuntime}
+            >
+              {checkingImageGenRuntime ? "Controllo runtime immagini…" : "🔎 Rileva sd-cli"}
+            </button>
+          </div>
+          <div style={{ marginTop:10, background:"rgba(253,250,244,0.6)", backdropFilter:"blur(12px)", WebkitBackdropFilter:"blur(12px)", border:"1px solid rgba(255,255,255,0.4)", borderRadius:14, padding:"12px 14px" }}>
+            <div style={{ fontSize:13, color: imageGenRuntimeStatus?.found ? "#2E7D32" : "#5C5245", fontWeight:600, marginBottom:6 }}>
+              {imageGenRuntimeStatus?.found
+                ? "stable-diffusion.cpp rilevato"
+                : checkingImageGenRuntime
+                  ? "Controllo runtime immagini in corso…"
+                  : "Setup guidato stable-diffusion.cpp"}
+            </div>
+              <div style={{ fontSize:12, color:"#888", lineHeight:1.55 }}>
+              {imageGenRuntimeStatus?.found
+                ? `${imageGenRuntimeStatus.source === "bundled" ? "Runtime incorporato" : "Runtime di sistema"} · ${imageGenRuntimeStatus.resolvedPath}${imageGenRuntimeStatus.version ? ` · ${imageGenRuntimeStatus.version}` : ""}`
+                : imageGenRuntimeStatus?.error
+                  ? imageGenRuntimeStatus.error
+                  : "Il modello scaricato non basta da solo: per generare la foto del piatto serve anche il binario `sd-cli` di stable-diffusion.cpp."}
+            </div>
+            {!imageGenRuntimeStatus?.found && (
+              <div style={{ fontSize:12, color:"#888", marginTop:8, lineHeight:1.5 }}>
+                Nelle build desktop aggiornate RecipeVault prova a usare prima il runtime incorporato. Se non viene rilevato, puoi comunque indicare manualmente un `sd-cli` esterno.
+              </div>
+            )}
           </div>
           {imageGenDownloadStatus && (
             <div style={{ marginTop:12, background:"rgba(253,250,244,0.6)", backdropFilter:"blur(12px)", WebkitBackdropFilter:"blur(12px)", border:"1px solid rgba(255,255,255,0.4)", borderRadius:14, padding:"12px 14px" }}>
@@ -4558,6 +4963,89 @@ export default function App() {
         <p style={{ fontSize:12, color:"#888", marginTop:5, lineHeight:1.5 }}>
           Questo provider viene usato per la ricerca testuale nel ricettario e per la generazione della lista della spesa.
         </p>
+      </div>
+
+      <div style={{ marginBottom:18, background:"rgba(255,255,255,0.32)", border:"1px solid rgba(255,255,255,0.42)", borderRadius:16, padding:"14px 16px" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", gap:12, alignItems:"center", flexWrap:"wrap", marginBottom:8 }}>
+          <div>
+            <div style={{ fontSize:14, fontWeight:700, color:"#3C3526" }}>⚡ AI di sistema per task semplici</div>
+            <div style={{ fontSize:12, color:"#7A7062", lineHeight:1.5, marginTop:4 }}>
+              Se disponibile, RecipeVault prova prima il modello integrato del Mac o il Prompt API di Chrome per <strong>ricerca AI</strong> e <strong>lista della spesa</strong>.
+            </div>
+          </div>
+          <button
+            style={{
+              width:44, height:24, borderRadius:12, border:"1px solid rgba(0,0,0,0.08)", cursor:"pointer",
+              background: systemSimpleAiEnabled ? "linear-gradient(180deg, #4a8254 0%, #3D6B47 100%)" : "linear-gradient(180deg, #ddd8cc 0%, #c8c0b4 100%)",
+              position:"relative", transition:"background .2s",
+              boxShadow: systemSimpleAiEnabled ? "inset 0 1px 3px rgba(0,0,0,0.15), 0 1px 0 rgba(255,255,255,0.1)" : "inset 0 1px 3px rgba(0,0,0,0.1)",
+            }}
+            onClick={() => saveAiPrefs({ ...aiPrefs, preferSystemSimpleAi: !systemSimpleAiEnabled })}
+            title={systemSimpleAiEnabled ? "Disattiva AI di sistema" : "Attiva AI di sistema"}
+          >
+            <span style={{
+              position:"absolute", top:2, left: systemSimpleAiEnabled ? 22 : 2,
+              width:20, height:20, borderRadius:"50%",
+              background:"linear-gradient(180deg, #fff 0%, #f0ece4 100%)",
+              boxShadow:"0 1px 4px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,0.9)",
+              transition:"left .2s ease",
+            }} />
+          </button>
+        </div>
+
+        {systemSimpleAiEnabled && (
+          <>
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:10 }}>
+              <button
+                style={{ ...S.btnSecondary, padding:"9px 12px", borderRadius:999 }}
+                onClick={refreshSystemSimpleAiStatus}
+                disabled={checkingSystemSimpleAi}
+              >
+                {checkingSystemSimpleAi ? "Verifico…" : "🔄 Verifica disponibilità"}
+              </button>
+              {systemSimpleAiAvailable && (
+                <div style={{ ...S.providerPill, margin:0, background:"#F4FBF4", color:"#2E7D32" }}>
+                  <span>Pronta</span>
+                  <span>{systemSimpleAiStatus.chrome?.available ? "Chrome" : "Apple"}</span>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:isCompactUi ? "1fr" : "1fr 1fr", gap:10 }}>
+              {[{
+                key: "apple",
+                icon: "🍎",
+                label: "Apple Intelligence",
+                status: systemSimpleAiStatus.apple,
+              }, {
+                key: "chrome",
+                icon: "🌐",
+                label: "Chrome Prompt API",
+                status: systemSimpleAiStatus.chrome,
+              }].map(entry => (
+                <div key={entry.key} style={{ background:"rgba(253,250,244,0.6)", border:"1px solid rgba(255,255,255,0.42)", borderRadius:14, padding:"12px 14px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", gap:10, alignItems:"center", marginBottom:6 }}>
+                    <strong style={{ color:"#3C3526", fontSize:13 }}>{entry.icon} {entry.label}</strong>
+                    <span style={{
+                      fontSize:11,
+                      fontWeight:700,
+                      color: entry.status?.available ? "#2E7D32" : "#8A7C69",
+                      background: entry.status?.available ? "rgba(46,125,50,0.12)" : "rgba(138,124,105,0.12)",
+                      border: entry.status?.available ? "1px solid rgba(46,125,50,0.22)" : "1px solid rgba(138,124,105,0.18)",
+                      borderRadius:999,
+                      padding:"4px 8px",
+                    }}>
+                      {entry.status?.available ? "Disponibile" : entry.status?.supported === false ? "Non supportata" : "Non pronta"}
+                    </span>
+                  </div>
+                  <div style={{ fontSize:12, color:"#7A7062", lineHeight:1.55 }}>
+                    {entry.status?.error || entry.status?.reason || "Nessuna verifica ancora eseguita."}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
       </div>
 
       {renderCommonAiAssetsBlock()}
@@ -5260,10 +5748,10 @@ export default function App() {
                         <span>{recipes.length}</span>
                         <span>ricette salvate</span>
                       </div>
-                      {activeAiReady && (
+                      {(activeAiReady || systemSimpleAiAvailable) && (
                         <div style={{ ...S.providerPill, minWidth:"max-content", margin:0, padding:"10px 12px", background:"#FDFAF4", color:"#5C5245" }}>
-                          <span>{activeProvider.icon}</span>
-                          <span>Ricerca: {activeProvider.name}</span>
+                          <span>{systemSimpleAiAvailable ? "⚡" : activeProvider.icon}</span>
+                          <span>{systemSimpleAiAvailable ? "AI di sistema attiva" : `Ricerca: ${activeProvider.name}`}</span>
                         </div>
                       )}
                       <button style={{ ...S.btnSecondary, minWidth:"max-content", padding:"10px 14px", borderRadius:999 }} onClick={() => openAiConfigModal({ provider: searchProviderKey })}>⚙️ AI</button>
@@ -5360,7 +5848,11 @@ export default function App() {
                     color:"#5C5245",
                     whiteSpace:"nowrap",
                   }}>
-                    {activeAiReady ? `${activeProvider.icon} ${activeProvider.name}` : "Configura un provider AI"}
+                    {systemSimpleAiAvailable
+                      ? "⚡ AI di sistema"
+                      : activeAiReady
+                        ? `${activeProvider.icon} ${activeProvider.name}`
+                        : "Configura un provider AI"}
                   </div>
                 </div>
 
@@ -5378,7 +5870,7 @@ export default function App() {
                   <button
                     style={{ ...S.btnPrimary, justifyContent:"center", ...(isCompactUi ? { width:"100%", padding:"14px 18px", borderRadius:16 } : {}) }}
                     onClick={() => runAiRecipeSearch()}
-                    disabled={aiSearching || !aiSearchQuery.trim() || !recipes.length || !activeAiReady}
+                    disabled={aiSearching || !aiSearchQuery.trim() || !recipes.length || !simpleTaskAiReady}
                   >
                     {aiSearching ? "Cerco…" : "Cerca con AI"}
                   </button>
@@ -5400,7 +5892,7 @@ export default function App() {
                         setAiSearchQuery(suggestion);
                         runAiRecipeSearch(suggestion);
                       }}
-                      disabled={aiSearching || !recipes.length || !activeAiReady}
+                      disabled={aiSearching || !recipes.length || !simpleTaskAiReady}
                     >
                       {suggestion}
                     </button>
@@ -5440,9 +5932,9 @@ export default function App() {
                   </div>
                 )}
 
-                {!activeAiReady && (
+                {!simpleTaskAiReady && (
                   <div style={{ marginTop:12, fontSize:12, color:"#8A7C69", lineHeight:1.55 }}>
-                    Per usare questa ricerca configura prima il provider AI nel <strong>pannello Configurazione AI</strong>.
+                    Per usare questa ricerca configura il provider AI oppure abilita un modello di sistema nel <strong>pannello Configurazione AI</strong>.
                   </div>
                 )}
               </div>
@@ -5648,6 +6140,167 @@ export default function App() {
         </div>
       )}
 
+      {recipeImageDialog && (
+        <div
+          style={{ ...S.overlay, zIndex:1125 }}
+          onClick={e => {
+            if (recipeImageDialog.status !== "loading" && e.target === e.currentTarget) {
+              setRecipeImageDialog(null);
+            }
+          }}
+        >
+          <div style={{
+            background:"rgba(253,250,244,0.82)",
+            backdropFilter:"blur(60px) saturate(200%)",
+            WebkitBackdropFilter:"blur(60px) saturate(200%)",
+            border:"1px solid rgba(255,255,255,0.4)",
+            borderRadius:isCompactUi ? 24 : 20,
+            padding:isCompactUi ? "28px 22px" : "28px 32px",
+            maxWidth:460,
+            width:"92%",
+            boxShadow:"0 16px 48px rgba(0,0,0,.15), inset 0 1px 0 rgba(255,255,255,0.5)",
+            textAlign:"center",
+          }}>
+            <div style={{ fontSize:40, marginBottom:10 }}>
+              {recipeImageDialog.status === "loading" ? "🖼️" : "⚠️"}
+            </div>
+            <div style={{ fontFamily:"'Playfair Display',serif", fontSize:22, color:"#1C1A14", marginBottom:8 }}>
+              {recipeImageDialog.title}
+            </div>
+            <div style={{ fontSize:14, color:"#6F6558", lineHeight:1.65, whiteSpace:"pre-wrap" }}>
+              {recipeImageDialog.message}
+            </div>
+
+            {recipeImageDialog.status === "loading" && (
+              <>
+                <div style={{ ...S.spinner, margin:"18px auto 0" }}/>
+                <div style={{ fontSize:12, color:"#8A7E6B", marginTop:12 }}>
+                  Il runtime locale potrebbe impiegare un po' a inizializzarsi, soprattutto al primo avvio.
+                </div>
+              </>
+            )}
+
+            {recipeImageDialog.status !== "loading" && (
+              <div style={{ display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap", marginTop:20 }}>
+                {recipeImageDialog.canOpenConfig && (
+                  <button
+                    style={{ ...S.btnSecondary, justifyContent:"center", ...(isCompactUi ? { width:"100%", padding:"13px 16px", borderRadius:14 } : {}) }}
+                    onClick={() => {
+                      setRecipeImageDialog(null);
+                      openAiConfigModal({ provider: "local" });
+                    }}
+                  >
+                    ⚙️ Apri configurazione AI
+                  </button>
+                )}
+                <button
+                  style={{ ...S.btnPrimary, justifyContent:"center", ...(isCompactUi ? { width:"100%", padding:"13px 16px", borderRadius:14 } : {}) }}
+                  onClick={() => setRecipeImageDialog(null)}
+                >
+                  Chiudi
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {photoViewer && (
+        <div
+          style={{ ...S.overlay, zIndex:1175, background:"rgba(12,10,8,0.88)", backdropFilter:"blur(14px)" }}
+          onClick={e => { if (e.target === e.currentTarget) closePhotoViewer(); }}
+        >
+          <div style={{
+            width:"min(96vw, 1320px)",
+            height:"min(92vh, 980px)",
+            display:"grid",
+            gridTemplateRows:"auto 1fr",
+            gap:12,
+            padding:isCompactUi ? "16px 14px calc(16px + env(safe-area-inset-bottom))" : "18px",
+            borderRadius:isCompactUi ? 24 : 20,
+            background:"rgba(30,26,22,0.72)",
+            border:"1px solid rgba(255,255,255,0.12)",
+            boxShadow:"0 20px 60px rgba(0,0,0,0.35)",
+          }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:12, flexWrap:"wrap" }}>
+              <div>
+                <div style={{ fontFamily:"'Playfair Display',serif", fontSize:isCompactUi ? 24 : 22, color:"#F5F0E8" }}>
+                  {photoViewer.title || "Foto ricetta"}
+                </div>
+                <div style={{ fontSize:12, color:"rgba(245,240,232,0.72)", marginTop:4 }}>
+                  Rotellina o pulsanti per zoomare. `Esc` per chiudere.
+                </div>
+              </div>
+              <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                <button
+                  style={{ ...S.btnSecondary, minWidth:48, justifyContent:"center", padding:"10px 14px", borderRadius:14 }}
+                  onClick={() => zoomPhotoViewer(-0.25)}
+                  disabled={photoViewerScale <= 1}
+                >
+                  −
+                </button>
+                <button
+                  style={{ ...S.btnSecondary, minWidth:84, justifyContent:"center", padding:"10px 14px", borderRadius:14 }}
+                  onClick={() => setPhotoViewerScale(1)}
+                  disabled={photoViewerScale === 1}
+                >
+                  {Math.round(photoViewerScale * 100)}%
+                </button>
+                <button
+                  style={{ ...S.btnSecondary, minWidth:48, justifyContent:"center", padding:"10px 14px", borderRadius:14 }}
+                  onClick={() => zoomPhotoViewer(0.25)}
+                  disabled={photoViewerScale >= 4}
+                >
+                  +
+                </button>
+                <button
+                  style={{ ...S.btnPrimary, justifyContent:"center", padding:"10px 14px", borderRadius:14 }}
+                  onClick={closePhotoViewer}
+                >
+                  Chiudi
+                </button>
+              </div>
+            </div>
+
+            <div
+              ref={photoViewerViewportRef}
+              style={{
+                overflow: photoViewerScale > 1 ? "auto" : "hidden",
+                overscrollBehavior:"contain",
+                borderRadius:isCompactUi ? 20 : 18,
+                background:"rgba(245,240,232,0.06)",
+                border:"1px solid rgba(255,255,255,0.08)",
+                padding:isCompactUi ? 12 : 16,
+              }}
+            >
+              <div style={{
+                minHeight:"100%",
+                display:"flex",
+                alignItems:"center",
+                justifyContent:"center",
+              }}>
+                <img
+                  src={photoViewer.src}
+                  alt={photoViewer.title || "Foto ricetta"}
+                  style={{
+                    display:"block",
+                    width: photoViewerScale === 1 ? "auto" : `min(${Math.round(88 * photoViewerScale)}vw, ${Math.round(1200 * photoViewerScale)}px)`,
+                    maxWidth: photoViewerScale === 1 ? "100%" : "none",
+                    maxHeight: photoViewerScale === 1 ? "76vh" : "none",
+                    height:"auto",
+                    objectFit:"contain",
+                    borderRadius:16,
+                    boxShadow:"0 18px 40px rgba(0,0,0,0.28)",
+                    userSelect:"none",
+                  }}
+                  draggable={false}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {devModeOpen && activeRec?.devData && (
         <div style={{ ...S.overlay, zIndex:1150 }} onClick={e=>{if(e.target===e.currentTarget)setDevModeOpen(false);}}>
           <div style={{
@@ -5836,9 +6489,11 @@ export default function App() {
             {modal==="list" && <>
               <h2 style={S.modalTitle}>🛒 Crea lista della spesa</h2>
               <p style={{ fontSize:13, color:"#888", marginBottom:14 }}>
-                {activeAiReady
-                  ? `L'AI (${activeProvider.icon} ${activeProvider.name}) aggrega gli ingredienti di ${sel.length} ricette`
-                  : "Per generare la lista serve prima configurare un provider nel pannello Configurazione AI."}
+                {systemSimpleAiAvailable
+                  ? `L'AI di sistema prova per prima ad aggregare gli ingredienti di ${sel.length} ricette.`
+                  : activeAiReady
+                    ? `L'AI (${activeProvider.icon} ${activeProvider.name}) aggrega gli ingredienti di ${sel.length} ricette`
+                    : "Per generare la lista serve configurare un provider o abilitare l'AI di sistema nel pannello Configurazione AI."}
               </p>
               {!sel.length && (
                 <div style={{ background:"#FFF8EC", border:"1px solid #F0D89A", borderRadius:12, padding:"12px 14px", marginBottom:14, fontSize:13, color:"#7A5C00", lineHeight:1.5 }}>
