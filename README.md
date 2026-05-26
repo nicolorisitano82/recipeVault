@@ -1,4 +1,4 @@
-# 🍽 RecipeVault — App Desktop (Tauri + React)
+# 📸 CookSnap — App Desktop (Tauri + React)
 
 Gestore ricette standalone per macOS con shell Android, import AI da URL e foto, provider locale on-device e organizzazione del ricettario orientata all'uso quotidiano.
 
@@ -86,7 +86,7 @@ brew install node
 
 ```bash
 # Entra nella cartella del progetto
-cd recipevault
+cd cooksnap
 
 # Installa le dipendenze JavaScript
 npm install
@@ -107,7 +107,7 @@ npm run tauri:build
 
 Trovi il file `.app` in:
 ```
-src-tauri/target/release/bundle/macos/RecipeVault.app
+src-tauri/target/release/bundle/macos/CookSnap.app
 ```
 
 Trascinalo in `/Applications` per installarlo come qualsiasi altra app Mac.
@@ -123,7 +123,7 @@ npm run tauri:build:x64
 
 Output atteso:
 ```bash
-src-tauri/target/x86_64-apple-darwin/release/bundle/macos/RecipeVault.app
+src-tauri/target/x86_64-apple-darwin/release/bundle/macos/CookSnap.app
 ```
 
 ### Build universale (`arm64` + `x86_64`)
@@ -137,7 +137,7 @@ npm run tauri:build:universal
 
 Output atteso:
 ```bash
-src-tauri/target/universal-apple-darwin/release/bundle/macos/RecipeVault.app
+src-tauri/target/universal-apple-darwin/release/bundle/macos/CookSnap.app
 ```
 
 ---
@@ -147,7 +147,7 @@ src-tauri/target/universal-apple-darwin/release/bundle/macos/RecipeVault.app
 Nel repo trovi anche una versione Android apribile direttamente in Android Studio:
 
 ```text
-recipevault/android-studio
+cooksnap/android-studio
 ```
 
 Per aggiornare gli asset web usati dalla `WebView` Android:
@@ -166,7 +166,7 @@ android-studio/README.md
 
 ## ⚙️ Configurazione AI
 
-RecipeVault usa `Locale (on-device)` come provider predefinito. Dal pannello `Configurazione AI` puoi:
+CookSnap usa `Locale (on-device)` come provider predefinito. Dal pannello `Configurazione AI` puoi:
 
 - scegliere il provider di default per `import` e `ricerca`
 - configurare provider esterni come Claude e OpenAI
@@ -206,7 +206,7 @@ Le chiavi vengono salvate localmente nelle preferenze dell'app.
 ## 📁 Struttura del progetto
 
 ```
-recipevault/
+cooksnap/
 ├── src/
 │   ├── main.jsx          # Entry point React
 │   ├── App.jsx           # App completa (AI, UI, storage)

@@ -175,7 +175,7 @@ const AI_PROVIDERS = {
 
 const BUILTIN_SIMPLE_AI_PROVIDER = "__builtin_simple_ai__";
 const BUILTIN_SIMPLE_AI_MODEL = "system-simple";
-const BUILTIN_SIMPLE_AI_INSTRUCTIONS = "Sei l'assistente integrato di RecipeVault. Gestisci solo task semplici di ricerca, organizzazione e aggregazione ingredienti. Segui rigorosamente il formato richiesto nel prompt e non aggiungere testo extra.";
+const BUILTIN_SIMPLE_AI_INSTRUCTIONS = "Sei l'assistente integrato di CookSnap. Gestisci solo task semplici di ricerca, organizzazione e aggregazione ingredienti. Segui rigorosamente il formato richiesto nel prompt e non aggiungere testo extra.";
 
 const LOCAL_MODEL_DOWNLOADS = {
   desktop: {
@@ -1138,7 +1138,16 @@ function loadImageElement(dataUrl) {
 
 async function optimizeImageForImport(file) {
   const originalDataUrl = await readFileAsDataUrl(file);
-  const image = await loadImageElement(originalDataUrl);
+  const needsConversion = /^data:image\/(?:webp|heic|heif|avif)/i.test(originalDataUrl);
+
+  let image;
+  try {
+    image = await loadImageElement(originalDataUrl);
+  } catch {
+    // WebP/HEIC may fail to decode in some webviews — return raw data
+    return originalDataUrl;
+  }
+
   const maxDimension = 1440;
   const scale = Math.min(1, maxDimension / Math.max(image.width, image.height));
   const targetWidth = Math.max(1, Math.round(image.width * scale));
@@ -1155,8 +1164,14 @@ async function optimizeImageForImport(file) {
   context.fillRect(0, 0, targetWidth, targetHeight);
   context.drawImage(image, 0, 0, targetWidth, targetHeight);
 
-  const optimizedDataUrl = canvas.toDataURL("image/jpeg", 0.84);
-  return optimizedDataUrl.length < originalDataUrl.length ? optimizedDataUrl : originalDataUrl;
+  try {
+    // Always convert to JPEG: llama-mtmd-cli (stb_image) doesn't support webp/heic
+    const optimizedDataUrl = canvas.toDataURL("image/jpeg", 0.84);
+    if (needsConversion) return optimizedDataUrl;
+    return optimizedDataUrl.length < originalDataUrl.length ? optimizedDataUrl : originalDataUrl;
+  } catch {
+    return originalDataUrl;
+  }
 }
 
 function buildShoppingPrompt(recipes) {
@@ -2507,7 +2522,7 @@ function SetupScreen({ onSave }) {
 
         {err && <div style={{ ...S.errMsg, marginBottom:12 }}>{err}</div>}
         <button style={{ ...S.btnPrimary, width:"100%", justifyContent:"center", padding:"12px" }} onClick={save} disabled={testing}>
-          {testing ? "Verifico connessione…" : "Salva e avvia RecipeVault →"}
+          {testing ? "Verifico connessione…" : "Salva e avvia CookSnap →"}
         </button>
         <p style={{ fontSize:12, color:"#aaa", marginTop:18, lineHeight:1.6 }}>
           La chiave viene salvata solo localmente su questo Mac, mai inviata altrove.
@@ -2634,6 +2649,7 @@ export default function App() {
   });
   const [lists, setLists]     = useState(() => ls.get("rv_lists", []));
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const [viewportHeight, setViewportHeight] = useState(() => window.innerHeight);
   const [view, setView]       = useState("home");
   const [activeRec, setActiveRec] = useState(null);
   const [cat, setCat]         = useState("Tutte");
@@ -2698,6 +2714,7 @@ export default function App() {
   const [recipeImageDialog, setRecipeImageDialog] = useState(null); // { status, title, message, canOpenConfig }
   const [photoViewer, setPhotoViewer] = useState(null); // { src, title }
   const [photoViewerScale, setPhotoViewerScale] = useState(1);
+  const [photoViewerImageSize, setPhotoViewerImageSize] = useState({ width: 0, height: 0 });
   const [selMode, setSelMode] = useState(false);
   const [sel, setSel]         = useState([]);
   const [listName, setListName] = useState("");
@@ -2711,7 +2728,6 @@ export default function App() {
   const activeImportRequestRef = useRef(0);
   const cancelledImportRequestRef = useRef(null);
   const loadMsgTimeoutRef = useRef(null);
-  const photoViewerViewportRef = useRef(null);
 
   const toggleImperial = () => {
     setUseImperial(prev => {
@@ -2769,7 +2785,10 @@ export default function App() {
   const globalIngredientCatalog = buildIngredientCatalog(recipes);
 
   useEffect(() => {
-    const onResize = () => setViewportWidth(window.innerWidth);
+    const onResize = () => {
+      setViewportWidth(window.innerWidth);
+      setViewportHeight(window.innerHeight);
+    };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
@@ -2803,24 +2822,6 @@ export default function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [photoViewer]);
-
-  useEffect(() => {
-    if (!photoViewer || !photoViewerViewportRef.current) return undefined;
-
-    const viewport = photoViewerViewportRef.current;
-    const onWheel = event => {
-      event.preventDefault();
-      event.stopPropagation();
-      setPhotoViewerScale(prev => {
-        const delta = event.deltaY > 0 ? -0.12 : 0.12;
-        const next = +(prev + delta).toFixed(2);
-        return Math.min(4, Math.max(1, next));
-      });
-    };
-
-    viewport.addEventListener("wheel", onWheel, { passive: false });
-    return () => viewport.removeEventListener("wheel", onWheel);
   }, [photoViewer]);
 
   useEffect(() => {
@@ -3141,11 +3142,13 @@ export default function App() {
     if (!src) return;
     setPhotoViewer({ src, title });
     setPhotoViewerScale(1);
+    setPhotoViewerImageSize({ width: 0, height: 0 });
   };
 
   const closePhotoViewer = () => {
     setPhotoViewer(null);
     setPhotoViewerScale(1);
+    setPhotoViewerImageSize({ width: 0, height: 0 });
   };
 
   const zoomPhotoViewer = delta => {
@@ -4065,7 +4068,7 @@ export default function App() {
       const blob = new Blob([backup], { type:"application/json" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = "recipevault-backup.json";
+      a.download = "cooksnap-backup.json";
       a.click();
       URL.revokeObjectURL(a.href);
     } catch (e) {
@@ -4654,7 +4657,7 @@ export default function App() {
             </div>
             {!imageGenRuntimeStatus?.found && (
               <div style={{ fontSize:12, color:"#888", marginTop:8, lineHeight:1.5 }}>
-                Nelle build desktop aggiornate RecipeVault prova a usare prima il runtime incorporato. Se non viene rilevato, puoi comunque indicare manualmente un `sd-cli` esterno.
+                Nelle build desktop aggiornate CookSnap prova a usare prima il runtime incorporato. Se non viene rilevato, puoi comunque indicare manualmente un `sd-cli` esterno.
               </div>
             )}
           </div>
@@ -4701,7 +4704,7 @@ export default function App() {
         <div>
           <label style={S.label}>Trascrizione audio condivisa (fallback video)</label>
           <p style={{ fontSize:12, color:"#888", marginTop:2, marginBottom:8, lineHeight:1.5 }}>
-            Se un video non ha sottotitoli disponibili, RecipeVault può scaricare l’audio e trascriverlo con Whisper.
+            Se un video non ha sottotitoli disponibili, CookSnap può scaricare l’audio e trascriverlo con Whisper.
           </p>
           <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
             <button
@@ -4970,7 +4973,7 @@ export default function App() {
           <div>
             <div style={{ fontSize:14, fontWeight:700, color:"#3C3526" }}>⚡ AI di sistema per task semplici</div>
             <div style={{ fontSize:12, color:"#7A7062", lineHeight:1.5, marginTop:4 }}>
-              Se disponibile, RecipeVault prova prima il modello integrato del Mac o il Prompt API di Chrome per <strong>ricerca AI</strong> e <strong>lista della spesa</strong>.
+              Se disponibile, CookSnap prova prima {hasAppleSystemAiBridge() ? "Apple Intelligence" : hasNativeBridge() ? "il modello AI di sistema" : "il Prompt API di Chrome"} per <strong>ricerca AI</strong> e <strong>lista della spesa</strong>.
             </div>
           </div>
           <button
@@ -5006,23 +5009,26 @@ export default function App() {
               {systemSimpleAiAvailable && (
                 <div style={{ ...S.providerPill, margin:0, background:"#F4FBF4", color:"#2E7D32" }}>
                   <span>Pronta</span>
-                  <span>{systemSimpleAiStatus.chrome?.available ? "Chrome" : "Apple"}</span>
+                  <span>{systemSimpleAiStatus.apple?.available ? "Apple Intelligence" : systemSimpleAiStatus.chrome?.available ? "Chrome" : "Sistema"}</span>
                 </div>
               )}
             </div>
 
             <div style={{ display:"grid", gridTemplateColumns:isCompactUi ? "1fr" : "1fr 1fr", gap:10 }}>
-              {[{
-                key: "apple",
-                icon: "🍎",
-                label: "Apple Intelligence",
-                status: systemSimpleAiStatus.apple,
-              }, {
-                key: "chrome",
-                icon: "🌐",
-                label: "Chrome Prompt API",
-                status: systemSimpleAiStatus.chrome,
-              }].map(entry => (
+              {[
+                hasAppleSystemAiBridge() && {
+                  key: "apple",
+                  icon: "🍎",
+                  label: "Apple Intelligence",
+                  status: systemSimpleAiStatus.apple,
+                },
+                !hasNativeBridge() && {
+                  key: "chrome",
+                  icon: "🌐",
+                  label: "Chrome Prompt API",
+                  status: systemSimpleAiStatus.chrome,
+                },
+              ].filter(Boolean).map(entry => (
                 <div key={entry.key} style={{ background:"rgba(253,250,244,0.6)", border:"1px solid rgba(255,255,255,0.42)", borderRadius:14, padding:"12px 14px" }}>
                   <div style={{ display:"flex", justifyContent:"space-between", gap:10, alignItems:"center", marginBottom:6 }}>
                     <strong style={{ color:"#3C3526", fontSize:13 }}>{entry.icon} {entry.label}</strong>
@@ -5720,7 +5726,7 @@ export default function App() {
               <>
                 <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:view==="home" ? 14 : 0 }}>
                   <div style={{ minWidth:0, flex:1 }}>
-                    <div style={{ fontSize:11, letterSpacing:"1.3px", textTransform:"uppercase", color:"#8A7C69", marginBottom:4 }}>RecipeVault</div>
+                    <div style={{ fontSize:11, letterSpacing:"1.3px", textTransform:"uppercase", color:"#8A7C69", marginBottom:4 }}>CookSnap</div>
                     <div style={{ fontFamily:"'Playfair Display',serif", fontSize:28, lineHeight:1.05 }}>{pageTitle}</div>
                   </div>
                   {view==="home" && (
@@ -6206,6 +6212,18 @@ export default function App() {
       )}
 
       {photoViewer && (
+        (() => {
+          const viewerMaxWidth = Math.max(220, Math.min(viewportWidth * 0.88, isCompactUi ? viewportWidth - 56 : 1240));
+          const viewerMaxHeight = Math.max(220, viewportHeight * 0.72);
+          const naturalWidth = photoViewerImageSize.width || viewerMaxWidth;
+          const naturalHeight = photoViewerImageSize.height || viewerMaxHeight;
+          const fitRatio = Math.min(viewerMaxWidth / naturalWidth, viewerMaxHeight / naturalHeight, 1);
+          const baseWidth = Math.max(180, naturalWidth * fitRatio);
+          const baseHeight = Math.max(180, naturalHeight * fitRatio);
+          const renderedWidth = Math.round(baseWidth * photoViewerScale);
+          const renderedHeight = Math.round(baseHeight * photoViewerScale);
+
+          return (
         <div
           style={{ ...S.overlay, zIndex:1175, background:"rgba(12,10,8,0.88)", backdropFilter:"blur(14px)" }}
           onClick={e => { if (e.target === e.currentTarget) closePhotoViewer(); }}
@@ -6228,7 +6246,7 @@ export default function App() {
                   {photoViewer.title || "Foto ricetta"}
                 </div>
                 <div style={{ fontSize:12, color:"rgba(245,240,232,0.72)", marginTop:4 }}>
-                  Rotellina o pulsanti per zoomare. `Esc` per chiudere.
+                  Usa i pulsanti per zoomare. La rotellina scorre la foto. `Esc` per chiudere.
                 </div>
               </div>
               <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
@@ -6263,9 +6281,8 @@ export default function App() {
             </div>
 
             <div
-              ref={photoViewerViewportRef}
               style={{
-                overflow: photoViewerScale > 1 ? "auto" : "hidden",
+                overflow:"auto",
                 overscrollBehavior:"contain",
                 borderRadius:isCompactUi ? 20 : 18,
                 background:"rgba(245,240,232,0.06)",
@@ -6282,12 +6299,19 @@ export default function App() {
                 <img
                   src={photoViewer.src}
                   alt={photoViewer.title || "Foto ricetta"}
+                  onLoad={event => {
+                    const target = event.currentTarget;
+                    setPhotoViewerImageSize({
+                      width: target.naturalWidth || 0,
+                      height: target.naturalHeight || 0,
+                    });
+                  }}
                   style={{
                     display:"block",
-                    width: photoViewerScale === 1 ? "auto" : `min(${Math.round(88 * photoViewerScale)}vw, ${Math.round(1200 * photoViewerScale)}px)`,
-                    maxWidth: photoViewerScale === 1 ? "100%" : "none",
-                    maxHeight: photoViewerScale === 1 ? "76vh" : "none",
-                    height:"auto",
+                    width:`${renderedWidth}px`,
+                    height:`${renderedHeight}px`,
+                    maxWidth:"none",
+                    maxHeight:"none",
                     objectFit:"contain",
                     borderRadius:16,
                     boxShadow:"0 18px 40px rgba(0,0,0,0.28)",
@@ -6299,6 +6323,8 @@ export default function App() {
             </div>
           </div>
         </div>
+          );
+        })()
       )}
 
       {devModeOpen && activeRec?.devData && (

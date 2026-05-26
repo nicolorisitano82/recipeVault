@@ -245,7 +245,7 @@ fn backup_output_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| "Impossibile generare il nome del file di backup".to_owned())?
         .as_secs();
 
-    Ok(base_dir.join(format!("recipevault-backup-{ts}.json")))
+    Ok(base_dir.join(format!("cooksnap-backup-{ts}.json")))
 }
 
 fn local_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -638,7 +638,7 @@ fn fetch_youtube_audio_transcript(
     whisper_model: &str,
     url: &str,
 ) -> Result<String, String> {
-    let tmp_dir = std::env::temp_dir().join("recipevault_whisper");
+    let tmp_dir = std::env::temp_dir().join("cooksnap_whisper");
     let _ = fs::create_dir_all(&tmp_dir);
 
     let ts = SystemTime::now()
@@ -661,7 +661,7 @@ fn fetch_social_audio_transcript(
     whisper_model: &str,
     url: &str,
 ) -> Result<String, String> {
-    let tmp_dir = std::env::temp_dir().join("recipevault_whisper");
+    let tmp_dir = std::env::temp_dir().join("cooksnap_whisper");
     let _ = fs::create_dir_all(&tmp_dir);
 
     let ts = SystemTime::now()
@@ -789,7 +789,7 @@ fn write_data_url_image_to_temp(data_url: &str) -> Result<PathBuf, String> {
     let bytes = BASE64_STANDARD
         .decode(base64_data.as_bytes())
         .map_err(|error| format!("Immagine base64 non valida: {error}"))?;
-    let temp_dir = std::env::temp_dir().join("recipevault_images");
+    let temp_dir = std::env::temp_dir().join("cooksnap_images");
     fs::create_dir_all(&temp_dir)
         .map_err(|error| format!("Impossibile creare la cartella temporanea immagini: {error}"))?;
 
@@ -797,13 +797,31 @@ fn write_data_url_image_to_temp(data_url: &str) -> Result<PathBuf, String> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let file_path = temp_dir.join(format!(
-        "photo_{ts}.{}",
-        image_extension_from_media_type(&media_type)
-    ));
+    let ext = image_extension_from_media_type(&media_type);
+    let file_path = temp_dir.join(format!("photo_{ts}.{ext}"));
 
     fs::write(&file_path, bytes)
         .map_err(|error| format!("Impossibile salvare temporaneamente la foto: {error}"))?;
+
+    // llama-mtmd-cli (stb_image) only supports jpg/png/bmp/gif — convert others via sips (macOS)
+    if !matches!(ext, "jpg" | "png" | "bmp" | "gif") {
+        let jpeg_path = temp_dir.join(format!("photo_{ts}.jpg"));
+        let result = std::process::Command::new("sips")
+            .args(["-s", "format", "jpeg", "-s", "formatOptions", "85"])
+            .arg(&file_path)
+            .arg("--out")
+            .arg(&jpeg_path)
+            .output();
+        match result {
+            Ok(output) if output.status.success() && jpeg_path.exists() => {
+                let _ = fs::remove_file(&file_path);
+                return Ok(jpeg_path);
+            }
+            _ => {
+                eprintln!("[OR-IMAGE] sips conversion failed for {ext}, passing original file");
+            }
+        }
+    }
 
     Ok(file_path)
 }
@@ -1983,7 +2001,7 @@ async fn generate_local_recipe_image(
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or(0);
-        let output_path = std::env::temp_dir().join(format!("recipevault-generated-{ts}.png"));
+        let output_path = std::env::temp_dir().join(format!("cooksnap-generated-{ts}.png"));
         let output_path_string = output_path.to_string_lossy().to_string();
 
         let mut cmd = Command::new(&runtime_path);
@@ -2194,7 +2212,7 @@ async fn fetch_url_content(client: &Client, url: &str) -> Result<ExtractedUrlCon
         .get(url)
         .header(
             reqwest::header::USER_AGENT,
-            "RecipeVault/1.0 (+https://recipevault.local)",
+            "CookSnap/1.0 (+https://cooksnap.local)",
         )
         .send()
         .await
@@ -2249,7 +2267,7 @@ fn extract_transcript_from_json3(json_path: &std::path::Path) -> Option<String> 
 }
 
 fn fetch_youtube_transcript(ytdlp_bin: &str, url: &str) -> Result<String, String> {
-    let tmp_dir = std::env::temp_dir().join("recipevault_yt");
+    let tmp_dir = std::env::temp_dir().join("cooksnap_yt");
     let _ = fs::create_dir_all(&tmp_dir);
 
     let ts = SystemTime::now()
@@ -2300,7 +2318,7 @@ fn fetch_youtube_transcript(ytdlp_bin: &str, url: &str) -> Result<String, String
 }
 
 fn extract_video_frames(ytdlp_bin: &str, ffmpeg_bin: &str, url: &str, max_frames: u32) -> Result<Vec<PathBuf>, String> {
-    let tmp_dir = std::env::temp_dir().join("recipevault_frames");
+    let tmp_dir = std::env::temp_dir().join("cooksnap_frames");
     let _ = fs::create_dir_all(&tmp_dir);
 
     let ts = SystemTime::now()
@@ -2486,7 +2504,7 @@ async fn run_local_model_download(
         .get(&url)
         .header(
             reqwest::header::USER_AGENT,
-            "RecipeVault/1.0 (+https://recipevault.local)",
+            "CookSnap/1.0 (+https://cooksnap.local)",
         )
         .send()
         .await;
@@ -3145,5 +3163,5 @@ fn main() {
             export_backup
         ])
         .run(tauri::generate_context!())
-        .expect("Errore durante l'avvio di RecipeVault");
+        .expect("Errore durante l'avvio di CookSnap");
 }
